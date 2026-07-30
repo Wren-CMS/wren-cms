@@ -1,0 +1,7 @@
+# Wren's database and SQLite journals — never commit a live site's data
+wren.db
+wren.db-wal
+wren.db-shm
+# OS noise
+.DS_Store
+Thumbs.db
