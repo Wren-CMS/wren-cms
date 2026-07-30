@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '0.1.0';
+const WREN_VERSION = '0.3.0';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -43,9 +43,20 @@ function db(): PDO
         $pdo->exec('PRAGMA foreign_keys = ON');
         if ($fresh) {
             wren_schema($pdo);
+        } else {
+            wren_migrate($pdo);
         }
     }
     return $pdo;
+}
+
+function wren_migrate(PDO $pdo): void
+{
+    // Tiny forward-only migrations so upgrades are just "replace index.php".
+    $cols = array_column($pdo->query('PRAGMA table_info(posts)')->fetchAll(), 'name');
+    if ($cols && !in_array('show_title', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN show_title INTEGER NOT NULL DEFAULT 1');
+    }
 }
 
 function wren_schema(PDO $pdo): void
@@ -68,6 +79,7 @@ function wren_schema(PDO $pdo): void
             title     TEXT NOT NULL,
             body      TEXT NOT NULL DEFAULT "",
             published INTEGER NOT NULL DEFAULT 1,
+            show_title INTEGER NOT NULL DEFAULT 1,
             position  INTEGER NOT NULL DEFAULT 0,
             created   TEXT NOT NULL,
             updated   TEXT NOT NULL
@@ -328,12 +340,22 @@ function unique_slug(string $slug, int $ignoreId = 0): string
 
 function menu_html(string $activeSlug = ''): string
 {
+    $homePage = setting('home_page');
     $items = [];
     $cls = ($activeSlug === '' ? ' class="active"' : '');
     $items[] = '<a href="' . e(url()) . '"' . $cls . '>Home</a>';
+    if ($homePage !== '') {
+        $blogSlug = setting('blog_slug', 'blog');
+        $cls = ($activeSlug === $blogSlug ? ' class="active"' : '');
+        $items[] = '<a href="' . e(url($blogSlug)) . '"' . $cls . '>'
+                 . e(setting('blog_title', 'Blog')) . '</a>';
+    }
     $st = db()->query('SELECT slug, title FROM posts WHERE type = "page" AND published = 1
                        ORDER BY position, title');
     foreach ($st as $p) {
+        if ($homePage !== '' && $p['slug'] === $homePage) {
+            continue; // shown as Home already
+        }
         $cls = ($activeSlug === $p['slug'] ? ' class="active"' : '');
         $items[] = '<a href="' . e(url($p['slug'])) . '"' . $cls . '>' . e($p['title']) . '</a>';
     }
@@ -477,7 +499,7 @@ HTML;
 
 /* ----------------------------------------------------------- public views */
 
-function view_home(): never
+function view_home(string $routeBase = ''): never
 {
     $perPage = max(1, (int)setting('posts_per_page', '5'));
     $pg = max(1, (int)($_GET['pg'] ?? 1));
@@ -492,11 +514,13 @@ function view_home(): never
     $st->execute();
     $posts = $st->fetchAll();
 
+    $listTitle = $routeBase === '' ? '' : setting('blog_title', 'Blog');
+
     if (!$posts && $pg === 1) {
         $content = '<article><h1 class="post-title">Nothing here yet</h1>'
                  . '<div class="post-body"><p>This site runs on Wren. '
                  . '<a href="' . e(url('admin')) . '">Sign in</a> to write your first article.</p></div></article>';
-        render('', $content);
+        render($listTitle, $content, $routeBase);
     }
 
     $out = [];
@@ -513,9 +537,9 @@ function view_home(): never
     $nav = '';
     $pages = (int)ceil($total / $perPage);
     if ($pages > 1) {
-        $mk = function (int $n, string $label) {
-            $sep = setting('pretty_urls') === '1' ? '?' : '&';
-            $u = $n === 1 ? url() : url() . ($sep === '&' && str_contains(url(), '?') ? '&' : '?') . 'pg=' . $n;
+        $mk = function (int $n, string $label) use ($routeBase) {
+            $base = $routeBase === '' ? url() : url($routeBase);
+            $u = $n === 1 ? $base : $base . (str_contains($base, '?') ? '&' : '?') . 'pg=' . $n;
             return '<a href="' . e($u) . '">' . $label . '</a>';
         };
         $nav = '<div class="pagination">'
@@ -524,20 +548,23 @@ function view_home(): never
              . '</div>';
     }
 
-    render('', implode("\n", $out) . $nav);
+    render($listTitle, implode("\n", $out) . $nav, $routeBase);
 }
 
-function view_post(array $post): never
+function view_post(array $post, bool $asHome = false): never
 {
     $meta = $post['type'] === 'article'
         ? '<p class="post-meta">' . e(gmdate('j F Y', strtotime($post['created']))) . '</p>'
         : '';
+    $h1 = ($post['show_title'] ?? 1)
+        ? '<h1 class="post-title">' . e($post['title']) . '</h1>'
+        : '';
     $content = '<article>'
-             . '<h1 class="post-title">' . e($post['title']) . '</h1>'
+             . $h1
              . $meta
              . '<div class="post-body">' . markdown($post['body']) . '</div>'
              . '</article>';
-    render($post['title'], $content, $post['slug']);
+    render($asHome ? '' : $post['title'], $content, $asHome ? '' : $post['slug']);
 }
 
 function view_404(): never
@@ -774,7 +801,10 @@ function view_admin_edit(?array $post, string $type): never
     $one = $type === 'page' ? 'page' : 'article';
     $posField = $type === 'page'
         ? '<label>Menu position <span class="hint">(lower shows first)</span>
-             <input type="number" name="position" value="' . (int)($post['position'] ?? 0) . '"></label>'
+             <input type="number" name="position" value="' . (int)($post['position'] ?? 0) . '"></label>
+           <label class="check"><input type="checkbox" name="show_title" value="1" '
+             . (($post['show_title'] ?? 1) ? 'checked' : '') . '>
+             Show title on the page <span class="hint">(untick for a homepage)</span></label>'
         : '';
     admin_shell($isNew ? "New $one" : 'Edit', '
       <h1>' . ($isNew ? "New $one" : 'Edit ' . $one) . '</h1>
@@ -805,20 +835,21 @@ function admin_save(): never
     $body = (string)($_POST['body'] ?? '');
     $published = isset($_POST['published']) ? 1 : 0;
     $position = (int)($_POST['position'] ?? 0);
+    $showTitle = ($type === 'page' && !isset($_POST['show_title'])) ? 0 : 1;
 
     if ($title === '') {
         flash('A title is required.');
         redirect(url($id ? 'admin/edit/' . $id : 'admin/new/' . $type));
     }
     if ($id) {
-        $st = db()->prepare('UPDATE posts SET title=?, slug=?, body=?, published=?, position=?, updated=?
-                             WHERE id=?');
-        $st->execute([$title, $slug, $body, $published, $position, now(), $id]);
+        $st = db()->prepare('UPDATE posts SET title=?, slug=?, body=?, published=?, position=?,
+                             show_title=?, updated=? WHERE id=?');
+        $st->execute([$title, $slug, $body, $published, $position, $showTitle, now(), $id]);
         flash('Saved.');
     } else {
-        $st = db()->prepare('INSERT INTO posts (type, slug, title, body, published, position, created, updated)
-                             VALUES (?,?,?,?,?,?,?,?)');
-        $st->execute([$type, $slug, $title, $body, $published, $position, now(), now()]);
+        $st = db()->prepare('INSERT INTO posts (type, slug, title, body, published, position,
+                             show_title, created, updated) VALUES (?,?,?,?,?,?,?,?,?)');
+        $st->execute([$type, $slug, $title, $body, $published, $position, $showTitle, now(), now()]);
         flash(ucfirst($type) . ' created.');
     }
     redirect(url($type === 'page' ? 'admin/pages' : 'admin'));
@@ -861,9 +892,24 @@ function view_admin_settings(): never
             set_setting('tagline', trim((string)($_POST['tagline'] ?? '')));
             set_setting('posts_per_page', (string)max(1, (int)($_POST['posts_per_page'] ?? 5)));
             set_setting('pretty_urls', isset($_POST['pretty_urls']) ? '1' : '0');
+            $hp = (string)($_POST['home_page'] ?? '');
+            if ($hp !== '' && !post_by_slug($hp)) {
+                $hp = ''; // only published pages can be the homepage
+            }
+            set_setting('home_page', $hp);
+            $bt = trim((string)($_POST['blog_title'] ?? '')) ?: 'Blog';
+            set_setting('blog_title', $bt);
+            $bs = slugify((string)($_POST['blog_slug'] ?? '') !== '' ? (string)$_POST['blog_slug'] : $bt);
+            set_setting('blog_slug', $bs);
             flash('Settings saved.');
         }
         redirect(url('admin/settings'));
+    }
+    $opts = '<option value="">Latest articles (default)</option>';
+    foreach (db()->query('SELECT slug, title FROM posts WHERE type = "page" AND published = 1
+                          ORDER BY position, title') as $p) {
+        $sel = setting('home_page') === $p['slug'] ? ' selected' : '';
+        $opts .= '<option value="' . e($p['slug']) . '"' . $sel . '>' . e($p['title']) . '</option>';
     }
     admin_shell('Settings', '
       <h1>Settings</h1>
@@ -872,6 +918,14 @@ function view_admin_settings(): never
         <input type="hidden" name="form" value="site">
         <label>Site title <input name="site_title" required value="' . e(setting('site_title', 'Wren')) . '"></label>
         <label>Tagline <input name="tagline" value="' . e(setting('tagline')) . '"></label>
+        <label>Homepage shows <span class="hint">(pick a page to run a page-first site)</span>
+          <select name="home_page">' . $opts . '</select></label>
+        <div class="row">
+          <label>Articles page name <span class="hint">(menu label when a page is the homepage)</span>
+            <input name="blog_title" value="' . e(setting('blog_title', 'Blog')) . '"></label>
+          <label>Articles page slug
+            <input name="blog_slug" value="' . e(setting('blog_slug', 'blog')) . '"></label>
+        </div>
         <div class="row">
           <label>Articles per page
             <input type="number" name="posts_per_page" min="1" value="' . e(setting('posts_per_page', '5')) . '"></label>
@@ -944,11 +998,23 @@ if (($seg[0] ?? '') === 'admin') {
     };
 }
 
+$homePage = setting('home_page');
+$blogSlug = setting('blog_slug', 'blog');
+
 if ($q === '') {
+    if ($homePage !== '' && ($hp = post_by_slug($homePage))) {
+        view_post($hp, true);
+    }
     view_home();
+}
+if ($homePage !== '' && $q === $blogSlug) {
+    view_home($blogSlug);
 }
 if ($q === 'rss') {
     view_rss();
+}
+if ($homePage !== '' && $seg[0] === $homePage) {
+    redirect(url()); // the homepage lives at /, keep one canonical address
 }
 
 $post = post_by_slug($seg[0]);
