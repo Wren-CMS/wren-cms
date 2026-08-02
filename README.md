@@ -2,6 +2,8 @@
 
 **A whole website in one small file.**
 
+**Website:** https://wrencms.com · **Documentation:** https://github.com/Wren-CMS/wren-cms/wiki
+
 Wren is a content management system in the spirit of sNews (2004–2016), rebuilt
 from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
