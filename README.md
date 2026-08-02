@@ -9,7 +9,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.3.0 "Tanneri" — stable · MIT licence
+Version 1.4.0 "Rufociliatus" — stable · MIT licence
 
 ## Requirements
 
