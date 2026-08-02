@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.0.0 "Troglodytes troglodytes" — stable · MIT licence
+Version 1.2.0 "Sissonii" — stable · MIT licence
 
 ## Requirements
 
