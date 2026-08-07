@@ -5,3 +5,10 @@ wren.db-shm
 # OS noise
 .DS_Store
 Thumbs.db
+
+# Local downloads and unzipped releases — never commit these
+*.zip
+Wren*/
+Articles*/
+wiki/
+wren/
