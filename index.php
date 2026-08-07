@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '0.3.0';
+const WREN_VERSION = '1.5.0';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -57,6 +57,32 @@ function wren_migrate(PDO $pdo): void
     if ($cols && !in_array('show_title', $cols, true)) {
         $pdo->exec('ALTER TABLE posts ADD COLUMN show_title INTEGER NOT NULL DEFAULT 1');
     }
+    if ($cols && !in_array('description', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN description TEXT NOT NULL DEFAULT ""');
+    }
+    if ($cols && !in_array('parent', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN parent INTEGER NOT NULL DEFAULT 0');
+    }
+    if ($cols && !in_array('newtab', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN newtab INTEGER NOT NULL DEFAULT 0');
+    }
+    if ($cols && !in_array('allow_comments', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN allow_comments INTEGER NOT NULL DEFAULT 1');
+        $pdo->exec('UPDATE posts SET allow_comments = 0 WHERE type = "page"');
+    }
+    $ucols = array_column($pdo->query('PRAGMA table_info(users)')->fetchAll(), 'name');
+    if ($ucols && !in_array('totp_secret', $ucols, true)) {
+        $pdo->exec('ALTER TABLE users ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ""');
+        $pdo->exec('ALTER TABLE users ADD COLUMN totp_last INTEGER NOT NULL DEFAULT 0');
+        $pdo->exec('ALTER TABLE users ADD COLUMN recovery TEXT NOT NULL DEFAULT ""');
+    }
+    $pdo->exec('CREATE TABLE IF NOT EXISTS comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+        author TEXT NOT NULL, body TEXT NOT NULL,
+        approved INTEGER NOT NULL DEFAULT 0,
+        created TEXT NOT NULL, ip TEXT NOT NULL DEFAULT "")');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_comments_post ON comments (post_id, approved, created)');
 }
 
 function wren_schema(PDO $pdo): void
@@ -70,7 +96,10 @@ function wren_schema(PDO $pdo): void
             id       INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
             password TEXT NOT NULL,
-            created  TEXT NOT NULL
+            created  TEXT NOT NULL,
+            totp_secret TEXT NOT NULL DEFAULT "",
+            totp_last   INTEGER NOT NULL DEFAULT 0,
+            recovery    TEXT NOT NULL DEFAULT ""
         );
         CREATE TABLE IF NOT EXISTS posts (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,17 +109,31 @@ function wren_schema(PDO $pdo): void
             body      TEXT NOT NULL DEFAULT "",
             published INTEGER NOT NULL DEFAULT 1,
             show_title INTEGER NOT NULL DEFAULT 1,
+            description TEXT NOT NULL DEFAULT "",
+            allow_comments INTEGER NOT NULL DEFAULT 1,
+            parent    INTEGER NOT NULL DEFAULT 0,
+            newtab    INTEGER NOT NULL DEFAULT 0,
             position  INTEGER NOT NULL DEFAULT 0,
             created   TEXT NOT NULL,
             updated   TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS comments (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id  INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+            author   TEXT NOT NULL,
+            body     TEXT NOT NULL,
+            approved INTEGER NOT NULL DEFAULT 0,
+            created  TEXT NOT NULL,
+            ip       TEXT NOT NULL DEFAULT ""
+        );
         CREATE INDEX IF NOT EXISTS idx_posts_type ON posts (type, published, created);
+        CREATE INDEX IF NOT EXISTS idx_comments_post ON comments (post_id, approved, created);
     ');
 }
 
 /* ---------------------------------------------------------------- settings */
 
-function setting(string $name, string $default = ''): string
+function settings_cache(?string $write = null, string $value = ''): array
 {
     static $cache = null;
     if ($cache === null) {
@@ -99,7 +142,15 @@ function setting(string $name, string $default = ''): string
             $cache[$row['name']] = $row['value'];
         }
     }
-    return $cache[$name] ?? $default;
+    if ($write !== null) {
+        $cache[$write] = $value;
+    }
+    return $cache;
+}
+
+function setting(string $name, string $default = ''): string
+{
+    return settings_cache()[$name] ?? $default;
 }
 
 function set_setting(string $name, string $value): void
@@ -107,6 +158,7 @@ function set_setting(string $name, string $value): void
     $st = db()->prepare('INSERT INTO settings (name, value) VALUES (?, ?)
                          ON CONFLICT(name) DO UPDATE SET value = excluded.value');
     $st->execute([$name, $value]);
+    settings_cache($name, $value); // keep same-request reads consistent
 }
 
 /* ----------------------------------------------------------------- helpers */
@@ -153,6 +205,13 @@ function url(string $route = ''): string
     return ($base ?: '') . '/?q=' . rawurlencode($route);
 }
 
+function abs_url(string $route = ''): string
+{
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    return $scheme . '://' . $host . url($route);
+}
+
 function redirect(string $to): never
 {
     header('Location: ' . $to);
@@ -168,6 +227,118 @@ function flash(?string $msg = null): ?string
     $m = $_SESSION['wren_flash'] ?? null;
     unset($_SESSION['wren_flash']);
     return $m;
+}
+
+/* ------------------------------------------------- two-factor (TOTP) auth */
+/* RFC 6238 time-based one-time passwords: 6 digits, 30-second steps, SHA-1 —
+   the combination every authenticator app speaks. No dependencies. */
+
+function base32_encode(string $bin): string
+{
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $bits = '';
+    foreach (str_split($bin) as $c) {
+        $bits .= str_pad(decbin(ord($c)), 8, '0', STR_PAD_LEFT);
+    }
+    $out = '';
+    foreach (str_split($bits, 5) as $chunk) {
+        $out .= $alphabet[bindec(str_pad($chunk, 5, '0', STR_PAD_RIGHT))];
+    }
+    return $out;
+}
+
+function base32_decode(string $b32): string
+{
+    $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    $b32 = strtoupper(preg_replace('/[^A-Za-z2-7]/', '', $b32));
+    $bits = '';
+    foreach (str_split($b32) as $c) {
+        $v = strpos($alphabet, $c);
+        if ($v === false) {
+            continue;
+        }
+        $bits .= str_pad(decbin($v), 5, '0', STR_PAD_LEFT);
+    }
+    $out = '';
+    foreach (str_split($bits, 8) as $byte) {
+        if (strlen($byte) === 8) {
+            $out .= chr(bindec($byte));
+        }
+    }
+    return $out;
+}
+
+function totp_code(string $secretB32, int $step): string
+{
+    $key = base32_decode($secretB32);
+    $msg = pack('J', $step);                       // 64-bit big-endian counter
+    $hash = hash_hmac('sha1', $msg, $key, true);
+    $offset = ord($hash[19]) & 0xf;
+    $part = ((ord($hash[$offset]) & 0x7f) << 24)
+          | ((ord($hash[$offset + 1]) & 0xff) << 16)
+          | ((ord($hash[$offset + 2]) & 0xff) << 8)
+          | (ord($hash[$offset + 3]) & 0xff);
+    return str_pad((string)($part % 1000000), 6, '0', STR_PAD_LEFT);
+}
+
+/* Returns the matching step number, or 0. Allows one step of clock drift
+   either way, and refuses any step already used (replay protection). */
+function totp_verify(string $secretB32, string $entered, int $lastUsed): int
+{
+    $entered = preg_replace('/\D/', '', $entered);
+    if (strlen($entered) !== 6) {
+        return 0;
+    }
+    $now = intdiv(time(), 30);
+    for ($i = -1; $i <= 1; $i++) {
+        $step = $now + $i;
+        if ($step <= $lastUsed) {
+            continue;
+        }
+        if (hash_equals(totp_code($secretB32, $step), $entered)) {
+            return $step;
+        }
+    }
+    return 0;
+}
+
+function recovery_generate(): array
+{
+    $codes = [];
+    for ($i = 0; $i < 8; $i++) {
+        $raw = strtolower(bin2hex(random_bytes(5)));      // 40 bits each
+        $codes[] = substr($raw, 0, 5) . '-' . substr($raw, 5);
+    }
+    return $codes;
+}
+
+function recovery_store(array $codes): string
+{
+    return json_encode(array_map(fn($c) => hash('sha256', $c), $codes));
+}
+
+/* Consumes a recovery code if it matches; returns true on success. */
+function recovery_use(array $user, string $entered): bool
+{
+    $entered = strtolower(trim($entered));
+    $hashes = json_decode($user['recovery'] ?: '[]', true) ?: [];
+    $hash = hash('sha256', $entered);
+    foreach ($hashes as $i => $h) {
+        if (hash_equals($h, $hash)) {
+            unset($hashes[$i]);
+            db()->prepare('UPDATE users SET recovery = ? WHERE id = ?')
+                ->execute([json_encode(array_values($hashes)), $user['id']]);
+            return true;
+        }
+    }
+    return false;
+}
+
+function totp_uri(string $secret, string $user): string
+{
+    $issuer = rawurlencode(setting('site_title', 'Wren'));
+    return 'otpauth://totp/' . $issuer . ':' . rawurlencode($user)
+         . '?secret=' . $secret . '&issuer=' . $issuer . '&period=30&digits=6';
 }
 
 /* ---------------------------------------------------------------- security */
@@ -294,6 +465,42 @@ function md_inline(string $s): string
     return preg_replace_callback('/\x02(\d+)\x03/', fn($m) => $stash[(int)$m[1]], $s);
 }
 
+/* --------------------------------------------------------------- indexnow */
+/* One quiet ping to api.indexnow.org when content changes tells Bing,
+   DuckDuckGo, Yandex, Seznam and Naver to recrawl within minutes. Silent,
+   short-timeout, fire-and-forget: publishing never breaks or blocks on it. */
+
+function indexnow_key(): string
+{
+    $key = setting('indexnow_key');
+    if ($key === '') {
+        $key = bin2hex(random_bytes(16));
+        set_setting('indexnow_key', $key);
+    }
+    return $key;
+}
+
+function indexnow_ping(array $urls): void
+{
+    if (setting('indexnow', '1') !== '1' || !$urls || !ini_get('allow_url_fopen')) {
+        return;
+    }
+    $payload = json_encode([
+        'host'        => $_SERVER['HTTP_HOST'] ?? 'localhost',
+        'key'         => indexnow_key(),
+        'keyLocation' => abs_url(indexnow_key() . '.txt'),
+        'urlList'     => array_values(array_unique($urls)),
+    ]);
+    $ctx = stream_context_create(['http' => [
+        'method'        => 'POST',
+        'header'        => "Content-Type: application/json; charset=utf-8\r\n",
+        'content'       => $payload,
+        'timeout'       => 2,
+        'ignore_errors' => true,
+    ]]);
+    @file_get_contents(setting('indexnow_endpoint', 'https://api.indexnow.org/indexnow'), false, $ctx);
+}
+
 /* ------------------------------------------------------------------ posts */
 
 function post_by_slug(string $slug, bool $publishedOnly = true): ?array
@@ -307,7 +514,10 @@ function post_by_slug(string $slug, bool $publishedOnly = true): ?array
 
 function excerpt(string $body, int $limit = 320): string
 {
-    $plain = trim(strip_tags(markdown($body)));
+    $html = markdown($body);
+    // strip_tags keeps the *contents* of style/script blocks; remove them first
+    $html = preg_replace('/<(style|script)\b[^>]*>.*?<\/\1>/is', '', $html);
+    $plain = trim(strip_tags($html));
     $plain = preg_replace('/\s+/', ' ', $plain);
     // UTF-8 safe without requiring the mbstring extension.
     if (preg_match('/^.{0,' . $limit . '}$/us', $plain)) {
@@ -332,6 +542,81 @@ function unique_slug(string $slug, int $ignoreId = 0): string
     }
 }
 
+/* ---------------------------------------------------------- media library */
+
+function media_dir(): string
+{
+    $dir = WREN_DIR . '/media';
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755);
+        // Belt and braces: even though uploads are validated as images,
+        // make sure nothing in here can ever execute as PHP on Apache.
+        file_put_contents($dir . '/.htaccess',
+            "<FilesMatch \"\\.(?i:php|phtml|phar)$\">\nRequire all denied\n</FilesMatch>\n");
+    }
+    return $dir;
+}
+
+function media_url(string $file): string
+{
+    return base_path() . '/media/' . rawurlencode($file);
+}
+
+function media_list(): array
+{
+    $dir = media_dir();
+    $out = [];
+    foreach (scandir($dir) ?: [] as $f) {
+        if (preg_match('/\.(jpe?g|png|gif|webp)$/i', $f)) {
+            $out[$f] = filemtime($dir . '/' . $f);
+        }
+    }
+    arsort($out);
+    return array_keys($out);
+}
+
+function media_accept_upload(array $file, ?string &$error): ?string
+{
+    $error = null;
+    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+        $error = $file['error'] === UPLOAD_ERR_INI_SIZE || $file['error'] === UPLOAD_ERR_FORM_SIZE
+            ? 'That file is bigger than this server allows (' . ini_get('upload_max_filesize') . ' max).'
+            : 'The upload did not arrive intact — try again.';
+        return null;
+    }
+    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if ($ext === 'jpeg') {
+        $ext = 'jpg';
+    }
+    $allowed = ['jpg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif', 'webp' => 'image/webp'];
+    if (!isset($allowed[$ext])) {
+        $error = 'Only JPG, PNG, GIF and WebP images can be uploaded.';
+        return null;
+    }
+    $mime = function_exists('finfo_open')
+        ? (finfo_file(finfo_open(FILEINFO_MIME_TYPE), $file['tmp_name']) ?: '')
+        : ($allowed[$ext]); // hosts without fileinfo still get the decode check below
+    if ($mime !== $allowed[$ext]) {
+        $error = 'That file does not look like a ' . strtoupper($ext) . ' image.';
+        return null;
+    }
+    if (@getimagesize($file['tmp_name']) === false) {
+        $error = 'That file could not be read as an image.';
+        return null;
+    }
+    $base = slugify(pathinfo($file['name'], PATHINFO_FILENAME));
+    $name = $base . '.' . $ext;
+    $n = 2;
+    while (file_exists(media_dir() . '/' . $name)) {
+        $name = $base . '-' . $n++ . '.' . $ext;
+    }
+    if (!move_uploaded_file($file['tmp_name'], media_dir() . '/' . $name)) {
+        $error = 'The server could not save the file — check the folder is writable.';
+        return null;
+    }
+    return $name;
+}
+
 /* ------------------------------------------------------------- theme layer */
 /* If a file named theme.html sits beside this one, Wren uses it.
    Otherwise the built-in default below is used. Tags a theme may use:
@@ -341,34 +626,103 @@ function unique_slug(string $slug, int $ignoreId = 0): string
 function menu_html(string $activeSlug = ''): string
 {
     $homePage = setting('home_page');
-    $items = [];
+    $rows = db()->query('SELECT id, type, slug, title, body, position, parent, newtab FROM posts
+                         WHERE type IN ("page", "link") AND published = 1
+                         ORDER BY position, title')->fetchAll();
+    $byId = [];
+    foreach ($rows as $r) {
+        $byId[$r['id']] = $r;
+    }
+    $isHome = fn(array $r) => $homePage !== '' && $r['type'] === 'page' && $r['slug'] === $homePage;
+    $tops = [];
+    $children = [];
+    foreach ($rows as $r) {
+        if ($isHome($r)) {
+            continue; // shown as Home already
+        }
+        $pid = (int)$r['parent'];
+        if ($pid && isset($byId[$pid]) && !$isHome($byId[$pid])) {
+            $children[$pid][] = $r;
+        } else {
+            $tops[] = $r; // no parent, or parent unpublished/deleted/is-homepage: promote
+        }
+    }
+    $link = function (array $r) use ($activeSlug) {
+        if ($r['type'] === 'link') {
+            $u = trim($r['body']);
+            if ($u === '') { // heading-only menu label: no destination, still themed + focusable
+                return '<a href="#" class="menu-label" onclick="return false">' . e($r['title']) . '</a>';
+            }
+            $tb = !empty($r['newtab']) ? ' target="_blank" rel="noopener"' : '';
+            return '<a href="' . e($u) . '"' . $tb . '>' . e($r['title']) . '</a>';
+        }
+        $cls = $activeSlug === $r['slug'] ? ' class="active"' : '';
+        return '<a href="' . e(url($r['slug'])) . '"' . $cls . '>' . e($r['title']) . '</a>';
+    };
+    $entries = [];
     $cls = ($activeSlug === '' ? ' class="active"' : '');
-    $items[] = '<a href="' . e(url()) . '"' . $cls . '>Home</a>';
+    $entries[] = [PHP_INT_MIN, '<a href="' . e(url()) . '"' . $cls . '>Home</a>'];
     if ($homePage !== '') {
         $blogSlug = setting('blog_slug', 'blog');
         $cls = ($activeSlug === $blogSlug ? ' class="active"' : '');
-        $items[] = '<a href="' . e(url($blogSlug)) . '"' . $cls . '>'
-                 . e(setting('blog_title', 'Blog')) . '</a>';
+        $entries[] = [(int)setting('blog_position', '0'),
+            '<a href="' . e(url($blogSlug)) . '"' . $cls . '>' . e(setting('blog_title', 'Blog')) . '</a>'];
     }
-    $st = db()->query('SELECT slug, title FROM posts WHERE type = "page" AND published = 1
-                       ORDER BY position, title');
-    foreach ($st as $p) {
-        if ($homePage !== '' && $p['slug'] === $homePage) {
-            continue; // shown as Home already
+    foreach ($tops as $r) {
+        $kids = $children[$r['id']] ?? [];
+        if (!$kids) {
+            $entries[] = [(int)$r['position'], $link($r)];
+            continue;
         }
-        $cls = ($activeSlug === $p['slug'] ? ' class="active"' : '');
-        $items[] = '<a href="' . e(url($p['slug'])) . '"' . $cls . '>' . e($p['title']) . '</a>';
+        $branchActive = $activeSlug !== '' && ($r['slug'] === $activeSlug
+            || in_array($activeSlug, array_column($kids, 'slug'), true));
+        $sub = implode('', array_map($link, $kids));
+        $entries[] = [(int)$r['position'],
+            '<span class="menu-sub' . ($branchActive ? ' active-branch' : '') . '">'
+            . $link($r) . '<span class="menu-drop">' . $sub . '</span></span>'];
     }
-    return implode("\n", $items);
+    usort($entries, fn($a, $b) => $a[0] <=> $b[0]); // stable in PHP 8
+    return implode("\n", array_column($entries, 1));
 }
 
-function render(string $pageTitle, string $content, string $activeSlug = ''): never
+function render(string $pageTitle, string $content, string $activeSlug = '', array $seo = []): never
 {
     $themeFile = WREN_DIR . '/theme.html';
     $theme = is_file($themeFile) ? (string)file_get_contents($themeFile) : default_theme();
 
     $siteTitle = setting('site_title', 'Wren');
+
+    // ---- SEO head block: description, canonical, Open Graph / Twitter card
+    $desc = trim($seo['description'] ?? '') ?: setting('meta_description', setting('tagline'));
+    $fullTitle = $pageTitle !== '' ? $pageTitle . ' · ' . $siteTitle : $siteTitle;
+    $canonical = abs_url($seo['route'] ?? $activeSlug);
+    if (($seo['pg'] ?? 1) > 1) {
+        $canonical .= (str_contains($canonical, '?') ? '&' : '?') . 'pg=' . (int)$seo['pg'];
+    }
+    $head  = '<meta name="description" content="' . e($desc) . '">' . "\n";
+    $head .= '<link rel="canonical" href="' . e($canonical) . '">' . "\n";
+    $head .= '<meta property="og:site_name" content="' . e($siteTitle) . '">' . "\n";
+    $head .= '<meta property="og:type" content="' . e($seo['type'] ?? 'website') . '">' . "\n";
+    $head .= '<meta property="og:title" content="' . e($fullTitle) . '">' . "\n";
+    $head .= '<meta property="og:description" content="' . e($desc) . '">' . "\n";
+    $head .= '<meta property="og:url" content="' . e($canonical) . '">' . "\n";
+    if (($img = setting('og_image')) !== '') {
+        $head .= '<meta property="og:image" content="' . e($img) . '">' . "\n";
+    }
+    $head .= '<meta name="twitter:card" content="summary">';
+    if (str_contains($vars_menu = menu_html($activeSlug), 'menu-drop')) {
+        $head .= "\n" . '<style>.menu-sub{position:relative;display:inline-flex;align-items:center}'
+               . '.menu-drop{display:none;position:absolute;left:0;top:100%;min-width:11em;'
+               . 'background:#fff;border:1px solid rgba(0,0,0,.12);border-radius:6px;'
+               . 'padding:.35em 0;z-index:50;box-shadow:0 4px 12px rgba(0,0,0,.09);'
+               . 'text-align:left}'
+               . '.menu-sub:hover .menu-drop,.menu-sub:focus-within .menu-drop{display:block}'
+               . '.menu-drop a{display:block;padding:.35em 1em;margin:0!important;white-space:nowrap}'
+               . '.menu-label{cursor:default}</style>';
+    }
+
     $vars = [
+        '{{seo_head}}'   => $head,
         '{{site_title}}' => e($siteTitle),
         '{{tagline}}'    => e(setting('tagline')),
         '{{page_title}}' => e($pageTitle !== '' ? $pageTitle . ' · ' . $siteTitle : $siteTitle),
@@ -379,7 +733,11 @@ function render(string $pageTitle, string $content, string $activeSlug = ''): ne
         '{{year}}'       => gmdate('Y'),
         '{{generator}}'  => 'Wren ' . WREN_VERSION,
     ];
-    echo strtr($theme, $vars);
+    $html = strtr($theme, $vars);
+    if (!str_contains($theme, '{{seo_head}}')) {
+        $html = preg_replace('/<\/head>/i', $head . "\n</head>", $html, 1);
+    }
+    echo $html;
     exit;
 }
 
@@ -520,7 +878,7 @@ function view_home(string $routeBase = ''): never
         $content = '<article><h1 class="post-title">Nothing here yet</h1>'
                  . '<div class="post-body"><p>This site runs on Wren. '
                  . '<a href="' . e(url('admin')) . '">Sign in</a> to write your first article.</p></div></article>';
-        render($listTitle, $content, $routeBase);
+        render($listTitle, $content, $routeBase, ['route' => $routeBase]);
     }
 
     $out = [];
@@ -548,7 +906,92 @@ function view_home(string $routeBase = ''): never
              . '</div>';
     }
 
-    render($listTitle, implode("\n", $out) . $nav, $routeBase);
+    render($listTitle, implode("\n", $out) . $nav, $routeBase, ['route' => $routeBase, 'pg' => $pg]);
+}
+
+function comments_enabled(array $post): bool
+{
+    return in_array($post['type'], ['article', 'page'], true)
+        && setting('comments', '1') === '1'
+        && (int)($post['allow_comments'] ?? 1) === 1;
+}
+
+function handle_comment_post(array $post): void
+{
+    if (!comments_enabled($post) || $_SERVER['REQUEST_METHOD'] !== 'POST') {
+        return;
+    }
+    csrf_check();
+    if (trim((string)($_POST['website'] ?? '')) !== '') {
+        redirect(url($post['slug']) . '#comments'); // honeypot caught a bot; discard silently
+    }
+    $last = (int)($_SESSION['wren_last_comment'] ?? 0);
+    if (time() - $last < 30) {
+        flash('You are commenting a little fast — wait half a minute and try again.');
+        redirect(url($post['slug']) . '#comments');
+    }
+    $author = trim((string)($_POST['author'] ?? ''));
+    $body = trim((string)($_POST['comment'] ?? ''));
+    if ($author === '' || $body === '' || strlen($author) > 200 || strlen($body) > 12000) {
+        flash('A name (up to 80 characters) and a comment (up to 4000) are both needed.');
+        redirect(url($post['slug']) . '#comments');
+    }
+    $st = db()->prepare('INSERT INTO comments (post_id, author, body, approved, created, ip)
+                         VALUES (?, ?, ?, 0, ?, ?)');
+    $st->execute([$post['id'], $author, $body, now(), $_SERVER['REMOTE_ADDR'] ?? '']);
+    $_SESSION['wren_last_comment'] = time();
+    flash('Thanks — your comment is awaiting moderation and will appear once approved.');
+    redirect(url($post['slug']) . '#comments');
+}
+
+function comments_html(array $post): string
+{
+    if (!comments_enabled($post)) {
+        return '';
+    }
+    $st = db()->prepare('SELECT author, body, created FROM comments
+                         WHERE post_id = ? AND approved = 1 ORDER BY created');
+    $st->execute([$post['id']]);
+    $rows = $st->fetchAll();
+
+    $items = '';
+    foreach ($rows as $c) {
+        $items .= '<div class="comment"><p class="post-meta">' . e($c['author']) . ' &middot; '
+                . e(gmdate('j F Y', strtotime($c['created']))) . '</p>'
+                . '<p>' . nl2br(e($c['body'])) . '</p></div>';
+    }
+    $count = count($rows);
+    $notice = ($f = flash()) ? '<p class="comment-notice">' . e($f) . '</p>' : '';
+
+    return '
+<style>
+.comments { margin-top: 2.5rem; border-top: 1px solid var(--line, #ddd); padding-top: 1.5rem; }
+.comments h2 { font-size: 1.15em; }
+.comment { border-bottom: 1px solid var(--line, #eee); padding: 0.75rem 0; }
+.comment p { margin: 0.25rem 0; }
+.comment-form label { display: block; margin-top: 0.8rem; font-size: 0.9em; }
+.comment-form input[type=text], .comment-form textarea {
+  width: 100%; box-sizing: border-box; padding: 0.5rem 0.6rem; font: inherit;
+  border: 1px solid var(--line, #ccc); border-radius: 5px; }
+.comment-form textarea { min-height: 7rem; }
+.comment-form button { margin-top: 0.8rem; font: inherit; font-weight: 700; cursor: pointer;
+  padding: 0.55rem 1.2rem; border: 0; border-radius: 6px;
+  background: var(--orange, var(--moss, #444)); color: #fff; }
+.comment-notice { border-left: 3px solid var(--orange, var(--moss, #888));
+  background: var(--paper, var(--straw, #f5f5f5)); padding: 0.6rem 0.9rem; }
+.hp-field { display: none; }
+</style>
+<section class="comments" id="comments">
+<h2>' . ($count ? $count . ' comment' . ($count === 1 ? '' : 's') : 'Comments') . '</h2>
+' . $items . $notice . '
+<form class="comment-form" method="post" action="' . e(url($post['slug'])) . '#comments">
+' . csrf_field() . '
+<div class="hp-field" aria-hidden="true"><label>Website <input type="text" name="website" tabindex="-1" autocomplete="off"></label></div>
+<label>Name <input type="text" name="author" maxlength="80" required></label>
+<label>Comment <textarea name="comment" maxlength="4000" required></textarea></label>
+<button>Post comment</button>
+</form>
+</section>';
 }
 
 function view_post(array $post, bool $asHome = false): never
@@ -563,8 +1006,13 @@ function view_post(array $post, bool $asHome = false): never
              . $h1
              . $meta
              . '<div class="post-body">' . markdown($post['body']) . '</div>'
+             . comments_html($post)
              . '</article>';
-    render($asHome ? '' : $post['title'], $content, $asHome ? '' : $post['slug']);
+    render($asHome ? '' : $post['title'], $content, $asHome ? '' : $post['slug'], [
+        'description' => trim($post['description'] ?? '') ?: excerpt($post['body'], 158),
+        'route'       => $asHome ? '' : $post['slug'],
+        'type'        => $post['type'] === 'article' ? 'article' : 'website',
+    ]);
 }
 
 function view_404(): never
@@ -580,27 +1028,47 @@ function view_rss(): never
 {
     $st = db()->query('SELECT * FROM posts WHERE type = "article" AND published = 1
                        ORDER BY created DESC LIMIT 10');
-    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    $abs = fn(string $u) => $scheme . '://' . $host . $u;
 
     header('Content-Type: application/rss+xml; charset=utf-8');
     echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
     echo '<rss version="2.0"><channel>';
     echo '<title>' . e(setting('site_title', 'Wren')) . '</title>';
-    echo '<link>' . e($abs(url())) . '</link>';
+    echo '<link>' . e(abs_url()) . '</link>';
     echo '<description>' . e(setting('tagline')) . '</description>';
     echo '<generator>Wren ' . WREN_VERSION . '</generator>';
     foreach ($st as $p) {
         echo '<item>';
         echo '<title>' . e($p['title']) . '</title>';
-        echo '<link>' . e($abs(url($p['slug']))) . '</link>';
-        echo '<guid>' . e($abs(url($p['slug']))) . '</guid>';
+        echo '<link>' . e(abs_url($p['slug'])) . '</link>';
+        echo '<guid>' . e(abs_url($p['slug'])) . '</guid>';
         echo '<pubDate>' . gmdate(DATE_RSS, strtotime($p['created'])) . '</pubDate>';
         echo '<description>' . e(excerpt($p['body'], 500)) . '</description>';
         echo '</item>';
     }
     echo '</channel></rss>';
+    exit;
+}
+
+function view_sitemap(): never
+{
+    header('Content-Type: application/xml; charset=utf-8');
+    echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
+    echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+    $homePage = setting('home_page');
+    echo '<url><loc>' . e(abs_url()) . '</loc></url>' . "\n";
+    if ($homePage !== '') {
+        echo '<url><loc>' . e(abs_url(setting('blog_slug', 'blog'))) . '</loc></url>' . "\n";
+    }
+    $st = db()->query('SELECT slug, updated FROM posts WHERE published = 1
+                       AND type IN ("article", "page") ORDER BY type, created');
+    foreach ($st as $p) {
+        if ($p['slug'] === $homePage) {
+            continue; // it lives at /
+        }
+        echo '<url><loc>' . e(abs_url($p['slug'])) . '</loc><lastmod>'
+           . gmdate('Y-m-d', strtotime($p['updated'])) . '</lastmod></url>' . "\n";
+    }
+    echo '</urlset>';
     exit;
 }
 
@@ -660,6 +1128,9 @@ function admin_shell(string $title, string $body, bool $nav = true): never
         $menu = '<nav>
             <a href="' . e(url('admin')) . '">Articles</a>
             <a href="' . e(url('admin/pages')) . '">Pages</a>
+            <a href="' . e(url('admin/links')) . '">Links</a>
+            <a href="' . e(url('admin/media')) . '">Media</a>
+            <a href="' . e(url('admin/comments')) . '">Comments' . admin_pending_badge() . '</a>
             <a href="' . e(url('admin/settings')) . '">Settings</a>
             <span class="grow"></span>
             <a href="' . e(url()) . '">View site</a>
@@ -718,6 +1189,28 @@ button.danger { background:transparent; color:var(--red); padding:0.2rem 0.4rem;
             padding:0.45rem 1rem; border-radius:4px; font-size:0.85rem; font-weight:600; }
 .btn-link:hover { background:var(--moss-d); }
 .muted { color:var(--quiet); font-size:0.82rem; }
+.upform { display:flex; gap:0.8rem; align-items:center; flex-wrap:wrap; margin:1rem 0 1.6rem;
+          padding:0.9rem; background:var(--straw); border-radius:8px; }
+.upform button { margin-top:0; }
+.upform input[type=file] { width:auto; background:transparent; border:0; padding:0.2rem 0; }
+.mgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px,1fr)); gap:1rem; }
+.mitem { border:1px solid var(--line); border-radius:8px; background:#fff; overflow:hidden; }
+.mitem img { width:100%; height:140px; object-fit:cover; display:block; background:var(--straw); }
+.mmeta { padding:0.6rem 0.7rem; font-size:0.8rem; }
+.mmeta b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.8rem; }
+.mmeta input { font-family:ui-monospace,Menlo,monospace; font-size:0.72rem; margin-top:0.4rem; cursor:pointer; }
+.mmeta form { display:inline; }
+.mmeta .danger { margin-top:0.2rem; padding-left:0; }
+.badge { background:var(--moss); color:#fff; border-radius:9px; padding:0 0.45rem;
+         font-size:0.7rem; font-weight:700; }
+button.approve { background:transparent; color:var(--moss-d); border:1px solid var(--moss);
+                 margin-top:0; padding:0.2rem 0.6rem; font-weight:600; font-size:0.85rem; }
+button.approve:hover { background:var(--moss); color:#fff; }
+.cbody { margin-top:0.35rem; font-size:0.88rem; }
+.codes { display:flex; flex-wrap:wrap; gap:0.5rem; margin:0.9rem 0; }
+.codes span { font-family:ui-monospace,Menlo,monospace; font-size:0.95rem; letter-spacing:0.05em;
+              background:var(--straw); border:1px solid var(--line); border-radius:5px;
+              padding:0.35rem 0.7rem; }
 </style></head><body><div class="shell">
 <p class="brand">Wren</p>' . $menu . $flashHtml . $body . '</div></body></html>';
     exit;
@@ -737,12 +1230,17 @@ function view_login(): never
         $u = $st->fetch();
         if ($u && password_verify((string)($_POST['password'] ?? ''), $u['password'])) {
             unset($_SESSION['wren_fails']);
-            $_SESSION['wren_user'] = $u['username'];
-            session_regenerate_id(true);
             if (password_needs_rehash($u['password'], PASSWORD_DEFAULT)) {
                 db()->prepare('UPDATE users SET password = ? WHERE id = ?')
                     ->execute([password_hash((string)$_POST['password'], PASSWORD_DEFAULT), $u['id']]);
             }
+            if (($u['totp_secret'] ?? '') !== '') {
+                session_regenerate_id(true);
+                $_SESSION['wren_2fa_pending'] = $u['id'];   // not signed in yet
+                redirect(url('admin/verify'));
+            }
+            $_SESSION['wren_user'] = $u['username'];
+            session_regenerate_id(true);
             redirect(url('admin'));
         }
         $_SESSION['wren_fails'] = $fails + 1;
@@ -759,6 +1257,54 @@ function view_login(): never
       </form>', false);
 }
 
+function view_2fa_verify(): never
+{
+    $id = (int)($_SESSION['wren_2fa_pending'] ?? 0);
+    if (!$id) {
+        redirect(url('admin/login'));
+    }
+    $st = db()->prepare('SELECT * FROM users WHERE id = ?');
+    $st->execute([$id]);
+    $u = $st->fetch();
+    if (!$u) {
+        unset($_SESSION['wren_2fa_pending']);
+        redirect(url('admin/login'));
+    }
+    $err = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $fails = (int)($_SESSION['wren_2fa_fails'] ?? 0);
+        if ($fails > 2) {
+            sleep(min($fails, 8));
+        }
+        $entered = trim((string)($_POST['code'] ?? ''));
+        $step = totp_verify($u['totp_secret'], $entered, (int)$u['totp_last']);
+        if ($step) {
+            db()->prepare('UPDATE users SET totp_last = ? WHERE id = ?')->execute([$step, $u['id']]);
+        }
+        if ($step || recovery_use($u, $entered)) {
+            unset($_SESSION['wren_2fa_pending'], $_SESSION['wren_2fa_fails']);
+            $_SESSION['wren_user'] = $u['username'];
+            session_regenerate_id(true);
+            redirect(url('admin'));
+        }
+        $_SESSION['wren_2fa_fails'] = $fails + 1;
+        $err = 'That code was not right. Codes change every 30 seconds — try the current one.';
+    }
+    admin_shell('Two-factor code', '
+      <h1>Enter your code</h1>
+      <p class="lede">Open your authenticator app and type the six-digit code for this site.</p>
+      ' . ($err ? '<p class="err">' . e($err) . '</p>' : '') . '
+      <form method="post">
+        ' . csrf_field() . '
+        <label>Six-digit code <span class="hint">(or one of your recovery codes)</span>
+          <input name="code" autocomplete="one-time-code" inputmode="text"
+                 autofocus required></label>
+        <button>Verify</button>
+      </form>
+      <p class="muted" style="margin-top:1.5rem"><a href="' . e(url('admin/logout')) . '">Cancel and start again</a></p>', false);
+}
+
 function view_admin_list(string $type): never
 {
     $st = db()->prepare('SELECT * FROM posts WHERE type = ? ORDER BY
@@ -771,7 +1317,7 @@ function view_admin_list(string $type): never
             <td><a href="' . e(url('admin/edit/' . $p['id'])) . '">' . e($p['title']) . '</a>' . $badge . '</td>
             <td class="muted">' . e(gmdate('j M Y', strtotime($p['created']))) . '</td>
             <td class="actions">
-              <a href="' . e(url($p['slug'])) . '">View</a> &nbsp;
+              <a href="' . e($p['type'] === 'link' ? (trim($p['body']) ?: url()) : url($p['slug'])) . '">View</a> &nbsp;
               <form method="post" action="' . e(url('admin/delete')) . '" style="display:inline"
                     onsubmit="return confirm(\'Delete &quot;' . e($p['title']) . '&quot;? This cannot be undone.\')">
                 ' . csrf_field() . '
@@ -783,8 +1329,8 @@ function view_admin_list(string $type): never
     if ($rows === '') {
         $rows = '<tr><td colspan="3" class="muted">Nothing here yet — write the first one.</td></tr>';
     }
-    $label = $type === 'page' ? 'Pages' : 'Articles';
-    $one = $type === 'page' ? 'page' : 'article';
+    $label = ['page' => 'Pages', 'link' => 'Menu links'][$type] ?? 'Articles';
+    $one = in_array($type, ['page', 'link'], true) ? $type : 'article';
     admin_shell($label, '
       <div class="topline">
         <h1>' . $label . '</h1>
@@ -795,13 +1341,54 @@ function view_admin_list(string $type): never
       </table>');
 }
 
+function parent_select(int $current, int $selfId): string
+{
+    $opts = '<option value="0">(top level)</option>';
+    $st = db()->query('SELECT id, title FROM posts WHERE type IN ("page", "link") AND parent = 0
+                       ORDER BY position, title');
+    foreach ($st as $p) {
+        if ((int)$p['id'] === $selfId) {
+            continue;
+        }
+        $sel = $current === (int)$p['id'] ? ' selected' : '';
+        $opts .= '<option value="' . (int)$p['id'] . '"' . $sel . '>' . e($p['title']) . '</option>';
+    }
+    return '<select name="parent">' . $opts . '</select>';
+}
+
 function view_admin_edit(?array $post, string $type): never
 {
     $isNew = $post === null;
+    if ($type === 'link') {
+        admin_shell($isNew ? 'New menu link' : 'Edit menu link', '
+      <h1>' . ($isNew ? 'New menu link' : 'Edit menu link') . '</h1>
+      <p class="lede">A menu entry that points anywhere — another site, a file, a download — or nowhere, as a heading for a dropdown.</p>
+      <form method="post" action="' . e(url('admin/save')) . '">
+        ' . csrf_field() . '
+        <input type="hidden" name="id" value="' . (int)($post['id'] ?? 0) . '">
+        <input type="hidden" name="type" value="link">
+        <label>Label <span class="hint">(what the menu shows)</span>
+          <input name="title" required value="' . e($post['title'] ?? '') . '"></label>
+        <label>URL <span class="hint">(leave blank to make a heading-only item other menu entries can sit under)</span>
+          <input name="body" placeholder="https://…"
+          value="' . e(trim($post['body'] ?? '')) . '"></label>
+        <label>Menu position <span class="hint">(lower shows first)</span>
+          <input type="number" name="position" value="' . (int)($post['position'] ?? 0) . '"></label>
+        <label>Menu parent <span class="hint">(nest under another menu item)</span>
+          ' . parent_select((int)($post['parent'] ?? 0), (int)($post['id'] ?? 0)) . '</label>
+        <label class="check"><input type="checkbox" name="newtab" value="1" '
+          . (($post['newtab'] ?? 0) ? 'checked' : '') . '> Open in a new tab</label>
+        <label class="check"><input type="checkbox" name="published" value="1" '
+          . (($post['published'] ?? 1) ? 'checked' : '') . '> Shown in menu</label>
+        <button>' . ($isNew ? 'Create' : 'Save changes') . '</button>
+      </form>');
+    }
     $one = $type === 'page' ? 'page' : 'article';
     $posField = $type === 'page'
         ? '<label>Menu position <span class="hint">(lower shows first)</span>
              <input type="number" name="position" value="' . (int)($post['position'] ?? 0) . '"></label>
+           <label>Menu parent <span class="hint">(nest this page under another menu item)</span>
+             ' . parent_select((int)($post['parent'] ?? 0), (int)($post['id'] ?? 0)) . '</label>
            <label class="check"><input type="checkbox" name="show_title" value="1" '
              . (($post['show_title'] ?? 1) ? 'checked' : '') . '>
              Show title on the page <span class="hint">(untick for a homepage)</span></label>'
@@ -816,10 +1403,15 @@ function view_admin_edit(?array $post, string $type): never
         <label>Slug <span class="hint">(leave blank to make one from the title)</span>
           <input name="slug" value="' . e($post['slug'] ?? '') . '"></label>
         ' . $posField . '
-        <label>Body <span class="hint">(markdown — **bold**, *italic*, # headings, [links](url), ``` code)</span>
+        <label>Search description <span class="hint">(for Google and social shares, ~155 characters; blank = automatic from the text)</span>
+          <input name="description" maxlength="300" value="' . e($post['description'] ?? '') . '"></label>
+        <label>Body <span class="hint">(markdown — **bold**, *italic*, # headings, [links](url), ``` code; images from <a href="' . e(url('admin/media')) . '">Media</a>)</span>
           <textarea name="body">' . e($post['body'] ?? '') . '</textarea></label>
         <label class="check"><input type="checkbox" name="published" value="1" '
           . (($post['published'] ?? 1) ? 'checked' : '') . '> Published</label>
+        <label class="check"><input type="checkbox" name="allow_comments" value="1" '
+          . (($post['allow_comments'] ?? ($type === 'article' ? 1 : 0)) ? 'checked' : '') . '>
+          Allow comments <span class="hint">(also requires comments to be on in Settings)</span></label>
         <button>' . ($isNew ? 'Create' : 'Save changes') . '</button>
       </form>');
 }
@@ -828,7 +1420,7 @@ function admin_save(): never
 {
     csrf_check();
     $id = (int)($_POST['id'] ?? 0);
-    $type = ($_POST['type'] ?? '') === 'page' ? 'page' : 'article';
+    $type = in_array($_POST['type'] ?? '', ['page', 'link'], true) ? $_POST['type'] : 'article';
     $title = trim((string)($_POST['title'] ?? ''));
     $slug = slugify((string)($_POST['slug'] ?? '') !== '' ? (string)$_POST['slug'] : $title);
     $slug = unique_slug($slug, $id);
@@ -836,6 +1428,24 @@ function admin_save(): never
     $published = isset($_POST['published']) ? 1 : 0;
     $position = (int)($_POST['position'] ?? 0);
     $showTitle = ($type === 'page' && !isset($_POST['show_title'])) ? 0 : 1;
+    $description = trim((string)($_POST['description'] ?? ''));
+    $allowComments = isset($_POST['allow_comments']) ? 1 : 0;
+    $newtab = isset($_POST['newtab']) ? 1 : 0;
+    $parent = (int)($_POST['parent'] ?? 0);
+    if ($parent > 0) {
+        $st = db()->prepare('SELECT id FROM posts WHERE id = ? AND type IN ("page", "link")
+                             AND parent = 0 AND id != ?');
+        $st->execute([$parent, $id]);
+        if (!$st->fetch()) {
+            $parent = 0; // parents must be existing top-level pages (one level deep)
+        }
+    }
+    if ($type === 'link') {
+        $body = trim($body);
+        if ($body !== '' && !preg_match('#^(https?://|/)#i', $body)) {
+            $body = 'https://' . $body; // bare domains become https
+        }
+    }
 
     if ($title === '') {
         flash('A title is required.');
@@ -843,36 +1453,251 @@ function admin_save(): never
     }
     if ($id) {
         $st = db()->prepare('UPDATE posts SET title=?, slug=?, body=?, published=?, position=?,
-                             show_title=?, updated=? WHERE id=?');
-        $st->execute([$title, $slug, $body, $published, $position, $showTitle, now(), $id]);
+                             show_title=?, description=?, allow_comments=?, parent=?, newtab=?,
+                             updated=? WHERE id=?');
+        $st->execute([$title, $slug, $body, $published, $position, $showTitle, $description,
+                      $allowComments, $parent, $newtab, now(), $id]);
+        if ($parent > 0) {
+            // one level deep: a page that becomes a child passes its children to the top
+            db()->prepare('UPDATE posts SET parent = 0 WHERE parent = ?')->execute([$id]);
+        }
         flash('Saved.');
     } else {
         $st = db()->prepare('INSERT INTO posts (type, slug, title, body, published, position,
-                             show_title, created, updated) VALUES (?,?,?,?,?,?,?,?,?)');
-        $st->execute([$type, $slug, $title, $body, $published, $position, $showTitle, now(), now()]);
+                             show_title, description, allow_comments, parent, newtab, created, updated)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+        $st->execute([$type, $slug, $title, $body, $published, $position, $showTitle, $description,
+                      $allowComments, $parent, $newtab, now(), now()]);
         flash(ucfirst($type) . ' created.');
     }
-    redirect(url($type === 'page' ? 'admin/pages' : 'admin'));
+    if ($published && $type !== 'link') {
+        indexnow_ping([abs_url($slug === setting('home_page') ? '' : $slug), abs_url()]);
+    }
+    redirect(url(['page' => 'admin/pages', 'link' => 'admin/links'][$type] ?? 'admin'));
 }
 
 function admin_delete(): never
 {
     csrf_check();
     $id = (int)($_POST['id'] ?? 0);
-    $st = db()->prepare('SELECT type FROM posts WHERE id = ?');
+    $st = db()->prepare('SELECT type, slug FROM posts WHERE id = ?');
     $st->execute([$id]);
     $p = $st->fetch();
     if ($p) {
         db()->prepare('DELETE FROM posts WHERE id = ?')->execute([$id]);
+        if ($p['type'] !== 'link') {
+            indexnow_ping([abs_url($p['slug']), abs_url()]);
+        }
         flash('Deleted.');
     }
-    redirect(url(($p['type'] ?? '') === 'page' ? 'admin/pages' : 'admin'));
+    redirect(url(['page' => 'admin/pages', 'link' => 'admin/links'][$p['type'] ?? ''] ?? 'admin'));
+}
+
+function comment_preview(string $body): string
+{
+    if (preg_match('/^.{0,400}/us', $body, $m) && $m[0] !== $body) {
+        return $m[0] . '…';
+    }
+    return $body;
+}
+
+function admin_pending_badge(): string
+{
+    $n = (int)db()->query('SELECT COUNT(*) c FROM comments WHERE approved = 0')->fetch()['c'];
+    return $n ? ' <span class="badge">' . $n . '</span>' : '';
+}
+
+function view_admin_comments(): never
+{
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $id = (int)($_POST['id'] ?? 0);
+        $st = db()->prepare('SELECT c.*, p.slug FROM comments c JOIN posts p ON p.id = c.post_id
+                             WHERE c.id = ?');
+        $st->execute([$id]);
+        $c = $st->fetch();
+        if ($c && ($_POST['action'] ?? '') === 'approve') {
+            db()->prepare('UPDATE comments SET approved = 1 WHERE id = ?')->execute([$id]);
+            indexnow_ping([abs_url($c['slug'])]);
+            flash('Approved.');
+        } elseif ($c && ($_POST['action'] ?? '') === 'delete') {
+            db()->prepare('DELETE FROM comments WHERE id = ?')->execute([$id]);
+            flash('Deleted.');
+        }
+        redirect(url('admin/comments'));
+    }
+    $st = db()->query('SELECT c.*, p.title, p.slug FROM comments c JOIN posts p ON p.id = c.post_id
+                       ORDER BY c.approved, c.created DESC');
+    $rows = '';
+    foreach ($st as $c) {
+        $status = $c['approved'] ? '' : '<span class="draft">pending</span>';
+        $approve = $c['approved'] ? '' : '
+              <form method="post" style="display:inline">' . csrf_field() . '
+                <input type="hidden" name="id" value="' . (int)$c['id'] . '">
+                <input type="hidden" name="action" value="approve">
+                <button class="approve">Approve</button></form> &nbsp;';
+        $rows .= '<tr>
+            <td><b>' . e($c['author']) . '</b>' . $status . '
+                <div class="muted">on <a href="' . e(url($c['slug'])) . '#comments">' . e($c['title']) . '</a>
+                &middot; ' . e(gmdate('j M Y H:i', strtotime($c['created']))) . '</div>
+                <div class="cbody">' . nl2br(e(comment_preview($c['body']))) . '</div></td>
+            <td class="actions">' . $approve . '
+              <form method="post" style="display:inline"
+                    onsubmit="return confirm(\'Delete this comment?\')">' . csrf_field() . '
+                <input type="hidden" name="id" value="' . (int)$c['id'] . '">
+                <input type="hidden" name="action" value="delete">
+                <button class="danger">Delete</button></form>
+            </td></tr>';
+    }
+    if ($rows === '') {
+        $rows = '<tr><td class="muted">No comments yet.</td></tr>';
+    }
+    admin_shell('Comments', '
+      <h1>Comments</h1>
+      <p class="lede">New comments wait here until you approve them. Nothing appears on the site without your say-so.</p>
+      <table>' . $rows . '</table>');
+}
+
+function view_admin_media(): never
+{
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        if (isset($_POST['delete'])) {
+            $f = basename((string)$_POST['delete']);
+            if (preg_match('/^[\w\-]+\.(jpe?g|png|gif|webp)$/i', $f) && is_file(media_dir() . '/' . $f)) {
+                unlink(media_dir() . '/' . $f);
+                flash('Image deleted.');
+            }
+        } elseif (!empty($_FILES['image']['name'])) {
+            $name = media_accept_upload($_FILES['image'], $err);
+            flash($name ? 'Uploaded ' . $name . ' — click its address below to copy it into a post.' : $err);
+        }
+        redirect(url('admin/media'));
+    }
+    $rows = '';
+    foreach (media_list() as $f) {
+        $u = media_url($f);
+        $kb = (int)round(filesize(media_dir() . '/' . $f) / 1024);
+        $rows .= '<div class="mitem">
+            <a href="' . e($u) . '"><img src="' . e($u) . '" alt="" loading="lazy"></a>
+            <div class="mmeta">
+              <b>' . e($f) . '</b> <span class="muted">' . $kb . ' KB</span>
+              <input readonly value="![' . e(pathinfo($f, PATHINFO_FILENAME)) . '](' . e($u) . ')"
+                     onclick="this.select();document.execCommand(\'copy\')" title="Click to copy markdown">
+              <form method="post" onsubmit="return confirm(\'Delete ' . e($f) . '?\')">
+                ' . csrf_field() . '
+                <input type="hidden" name="delete" value="' . e($f) . '">
+                <button class="danger">Delete</button>
+              </form>
+            </div></div>';
+    }
+    if ($rows === '') {
+        $rows = '<p class="muted">No images yet — upload the first one above.</p>';
+    }
+    $max = ini_get('upload_max_filesize');
+    admin_shell('Media', '
+      <h1>Media</h1>
+      <p class="lede">Upload images, then click an address to copy its markdown into any article or page.</p>
+      <form method="post" enctype="multipart/form-data" class="upform">
+        ' . csrf_field() . '
+        <input type="file" name="image" accept=".jpg,.jpeg,.png,.gif,.webp" required>
+        <button>Upload</button>
+        <span class="muted">JPG, PNG, GIF or WebP &middot; up to ' . e($max) . '</span>
+      </form>
+      <div class="mgrid">' . $rows . '</div>');
+}
+
+function twofactor_panel(): string
+{
+    $st = db()->prepare('SELECT * FROM users WHERE username = ?');
+    $st->execute([$_SESSION['wren_user']]);
+    $u = $st->fetch();
+    $on = ($u['totp_secret'] ?? '') !== '';
+
+    // Freshly generated recovery codes are shown exactly once.
+    if (!empty($_SESSION['wren_2fa_codes'])) {
+        $codes = $_SESSION['wren_2fa_codes'];
+        unset($_SESSION['wren_2fa_codes']);
+        $left = count(json_decode($u['recovery'] ?: '[]', true) ?: []);
+        return '<p class="flash">Save these recovery codes somewhere safe — each works once if you
+                lose your phone, and they will not be shown again.</p>
+                <div class="codes">' . implode('', array_map(fn($c) => '<span>' . e($c) . '</span>', $codes)) . '</div>
+                <p class="muted">' . (int)$left . ' unused codes.</p>';
+    }
+
+    if ($on) {
+        $left = count(json_decode($u['recovery'] ?: '[]', true) ?: []);
+        return '<p>Two-factor authentication is <b>on</b>. You will be asked for a six-digit code
+                after your password. ' . (int)$left . ' unused recovery codes remain.</p>
+          <form method="post">' . csrf_field() . '
+            <input type="hidden" name="form" value="2fa_off">
+            <label>Confirm your password to turn it off
+              <input type="password" name="password" autocomplete="current-password" required></label>
+            <button class="danger" style="border:1px solid var(--red);padding:0.5rem 1rem">Turn off two-factor</button>
+          </form>';
+    }
+
+    if (empty($_SESSION['wren_2fa_setup'])) {
+        return '<p class="lede">Add a second step to signing in: your password, then a six-digit
+                code from an authenticator app on your phone.</p>
+          <form method="post">' . csrf_field() . '
+            <input type="hidden" name="form" value="2fa_start">
+            <button>Set up two-factor</button>
+          </form>';
+    }
+
+    $secret = (string)$_SESSION['wren_2fa_setup'];
+    $pretty = trim(chunk_split($secret, 4, ' '));
+    return '<p>In your authenticator app (Google Authenticator, Authy, 1Password, or similar)
+            choose to add an account <b>by entering a key</b>, then type this one:</p>
+      <div class="codes"><span>' . e($pretty) . '</span></div>
+      <p class="muted">Account name: ' . e($_SESSION['wren_user']) . ' &middot; Type: time-based
+      &middot; Some apps also accept this address:<br><code style="font-size:0.75rem;word-break:break-all">'
+      . e(totp_uri($secret, $_SESSION['wren_user'])) . '</code></p>
+      <form method="post">' . csrf_field() . '
+        <input type="hidden" name="form" value="2fa_confirm">
+        <label>Now enter the six-digit code it shows <span class="hint">(this proves it works before we switch it on)</span>
+          <input name="code" inputmode="numeric" autocomplete="one-time-code" required></label>
+        <button>Turn on two-factor</button>
+      </form>';
 }
 
 function view_admin_settings(): never
 {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         csrf_check();
+        if (($_POST['form'] ?? '') === '2fa_start') {
+            $_SESSION['wren_2fa_setup'] = base32_encode(random_bytes(20));
+            redirect(url('admin/settings') . '#twofactor');
+        }
+        if (($_POST['form'] ?? '') === '2fa_confirm') {
+            $secret = (string)($_SESSION['wren_2fa_setup'] ?? '');
+            $step = $secret ? totp_verify($secret, (string)($_POST['code'] ?? ''), 0) : 0;
+            if (!$step) {
+                flash('That code was not right — two-factor authentication is still off. Check the time on your phone and try again.');
+                redirect(url('admin/settings') . '#twofactor');
+            }
+            $codes = recovery_generate();
+            db()->prepare('UPDATE users SET totp_secret = ?, totp_last = ?, recovery = ? WHERE username = ?')
+                ->execute([$secret, $step, recovery_store($codes), $_SESSION['wren_user']]);
+            unset($_SESSION['wren_2fa_setup']);
+            $_SESSION['wren_2fa_codes'] = $codes;   // shown once, on the next page load
+            flash('Two-factor authentication is on.');
+            redirect(url('admin/settings') . '#twofactor');
+        }
+        if (($_POST['form'] ?? '') === '2fa_off') {
+            $st = db()->prepare('SELECT * FROM users WHERE username = ?');
+            $st->execute([$_SESSION['wren_user']]);
+            $u = $st->fetch();
+            if (!$u || !password_verify((string)($_POST['password'] ?? ''), $u['password'])) {
+                flash('Password was wrong — two-factor authentication is still on.');
+            } else {
+                db()->prepare('UPDATE users SET totp_secret = "", totp_last = 0, recovery = "" WHERE id = ?')
+                    ->execute([$u['id']]);
+                flash('Two-factor authentication is off.');
+            }
+            redirect(url('admin/settings') . '#twofactor');
+        }
         if (($_POST['form'] ?? '') === 'password') {
             $st = db()->prepare('SELECT * FROM users WHERE username = ?');
             $st->execute([$_SESSION['wren_user']]);
@@ -892,6 +1717,10 @@ function view_admin_settings(): never
             set_setting('tagline', trim((string)($_POST['tagline'] ?? '')));
             set_setting('posts_per_page', (string)max(1, (int)($_POST['posts_per_page'] ?? 5)));
             set_setting('pretty_urls', isset($_POST['pretty_urls']) ? '1' : '0');
+            set_setting('meta_description', trim((string)($_POST['meta_description'] ?? '')));
+            set_setting('og_image', trim((string)($_POST['og_image'] ?? '')));
+            set_setting('indexnow', isset($_POST['indexnow']) ? '1' : '0');
+            set_setting('comments', isset($_POST['comments']) ? '1' : '0');
             $hp = (string)($_POST['home_page'] ?? '');
             if ($hp !== '' && !post_by_slug($hp)) {
                 $hp = ''; // only published pages can be the homepage
@@ -901,6 +1730,7 @@ function view_admin_settings(): never
             set_setting('blog_title', $bt);
             $bs = slugify((string)($_POST['blog_slug'] ?? '') !== '' ? (string)$_POST['blog_slug'] : $bt);
             set_setting('blog_slug', $bs);
+            set_setting('blog_position', (string)(int)($_POST['blog_position'] ?? 0));
             flash('Settings saved.');
         }
         redirect(url('admin/settings'));
@@ -918,6 +1748,10 @@ function view_admin_settings(): never
         <input type="hidden" name="form" value="site">
         <label>Site title <input name="site_title" required value="' . e(setting('site_title', 'Wren')) . '"></label>
         <label>Tagline <input name="tagline" value="' . e(setting('tagline')) . '"></label>
+        <label>Site search description <span class="hint">(shown for the homepage in Google; blank = tagline)</span>
+          <input name="meta_description" maxlength="300" value="' . e(setting('meta_description')) . '"></label>
+        <label>Social share image URL <span class="hint">(optional, used by Open Graph)</span>
+          <input name="og_image" value="' . e(setting('og_image')) . '"></label>
         <label>Homepage shows <span class="hint">(pick a page to run a page-first site)</span>
           <select name="home_page">' . $opts . '</select></label>
         <div class="row">
@@ -925,11 +1759,19 @@ function view_admin_settings(): never
             <input name="blog_title" value="' . e(setting('blog_title', 'Blog')) . '"></label>
           <label>Articles page slug
             <input name="blog_slug" value="' . e(setting('blog_slug', 'blog')) . '"></label>
+          <label>Articles menu position <span class="hint">(orders it among your pages)</span>
+            <input type="number" name="blog_position" value="' . e(setting('blog_position', '0')) . '"></label>
         </div>
         <div class="row">
           <label>Articles per page
             <input type="number" name="posts_per_page" min="1" value="' . e(setting('posts_per_page', '5')) . '"></label>
         </div>
+        <label class="check"><input type="checkbox" name="comments" value="1" '
+          . (setting('comments', '1') === '1' ? 'checked' : '') . '>
+          Allow comments on articles <span class="hint">(all comments are held for your approval)</span></label>
+        <label class="check"><input type="checkbox" name="indexnow" value="1" '
+          . (setting('indexnow', '1') === '1' ? 'checked' : '') . '>
+          Ping search engines on publish <span class="hint">(IndexNow: Bing, DuckDuckGo, Yandex &mdash; Google uses the sitemap instead)</span></label>
         <label class="check"><input type="checkbox" name="pretty_urls" value="1" '
           . (setting('pretty_urls') === '1' ? 'checked' : '') . '>
           Pretty URLs <span class="hint">(needs the .htaccess file from the Wren download)</span></label>
@@ -945,6 +1787,9 @@ function view_admin_settings(): never
           <input type="password" name="new_password" autocomplete="new-password" required></label>
         <button>Change password</button>
       </form>
+      <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">
+      <h1 style="font-size:1.2rem" id="twofactor">Two-factor authentication</h1>
+      ' . twofactor_panel() . '
       <p class="muted" style="margin-top:2.5rem">Wren ' . WREN_VERSION . ' &middot; database: wren.db (SQLite)</p>');
 }
 
@@ -976,6 +1821,9 @@ if (($seg[0] ?? '') === 'admin') {
     if ($sub === 'login') {
         is_admin() ? redirect(url('admin')) : view_login();
     }
+    if ($sub === 'verify') {
+        view_2fa_verify();
+    }
     if ($sub === 'logout') {
         session_destroy();
         redirect(url());
@@ -984,10 +1832,13 @@ if (($seg[0] ?? '') === 'admin') {
     match (true) {
         $sub === ''         => view_admin_list('article'),
         $sub === 'pages'    => view_admin_list('page'),
+        $sub === 'links'    => view_admin_list('link'),
+        $sub === 'media'    => view_admin_media(),
+        $sub === 'comments' => view_admin_comments(),
         $sub === 'settings' => view_admin_settings(),
         $sub === 'save'     => admin_save(),
         $sub === 'delete'   => admin_delete(),
-        $sub === 'new'      => view_admin_edit(null, ($seg[2] ?? 'article') === 'page' ? 'page' : 'article'),
+        $sub === 'new'      => view_admin_edit(null, in_array($seg[2] ?? '', ['page', 'link'], true) ? $seg[2] : 'article'),
         $sub === 'edit'     => (function () use ($seg) {
             $st = db()->prepare('SELECT * FROM posts WHERE id = ?');
             $st->execute([(int)($seg[2] ?? 0)]);
@@ -1013,9 +1864,29 @@ if ($homePage !== '' && $q === $blogSlug) {
 if ($q === 'rss') {
     view_rss();
 }
+if ($q === 'sitemap.xml') {
+    view_sitemap();
+}
+if (preg_match('/^([a-f0-9]{32})\.txt$/', $q, $m) && $m[1] === setting('indexnow_key')) {
+    header('Content-Type: text/plain; charset=utf-8');
+    echo $m[1];
+    exit;
+}
+if ($q === 'robots.txt') {
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "User-agent: *\nAllow: /\nSitemap: " . abs_url('sitemap.xml') . "\n";
+    exit;
+}
 if ($homePage !== '' && $seg[0] === $homePage) {
     redirect(url()); // the homepage lives at /, keep one canonical address
 }
 
 $post = post_by_slug($seg[0]);
-$post ? view_post($post) : view_404();
+if ($post && $post['type'] === 'link') {
+    redirect(trim($post['body']) ?: url());
+}
+if ($post) {
+    handle_comment_post($post);
+    view_post($post);
+}
+view_404();

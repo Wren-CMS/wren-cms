@@ -2,14 +2,12 @@
 
 **A whole website in one small file.**
 
-**Website:** https://wrencms.com · **Documentation:** https://github.com/Wren-CMS/wren-cms/wiki
-
 Wren is a content management system in the spirit of sNews (2004–2016), rebuilt
 from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.3.0 "Tanneri" — stable · MIT licence
+Version 1.0.0 · MIT licence
 
 ## Requirements
 
@@ -34,12 +32,23 @@ constant at the top of the file.
 ## Writing
 
 - **Articles** appear on the home page, newest first, and in the RSS feed (`/rss`).
-- **Pages** appear in the site menu (order them with *menu position*).
+- **Pages** appear in the site menu (order them with *menu position*, and
+  nest them one level deep with *menu parent* for dropdown submenus). A menu
+  link with a blank URL becomes a heading-only item for grouping.
 - Both are written in markdown: `**bold**`, `*italic*`, `# headings`,
   `[links](https://…)`, `![images](https://…)`, lists, quotes, and fenced
   ``` code blocks. Raw HTML passes through untouched — you're the admin,
   Wren trusts you.
 - Untick *Published* to keep something as a draft only you can see.
+- **Images:** upload JPG, PNG, GIF or WebP in the admin's Media tab, then click
+  an image's address to copy ready-made markdown into any post.
+- **Comments:** readers can comment on articles (and pages, if you opt one
+  in); every comment waits in the admin's Comments tab until you approve it.
+  Honeypot and rate-limiting keep casual spam out; each post has its own
+  "Allow comments" switch, plus a site-wide toggle in Settings.
+- **Page-first site:** in Settings, set *Homepage shows* to any page and your
+  front page becomes that page; the article list moves to its own menu entry
+  (name and address configurable, "Blog" by default).
 
 ## Theming
 
@@ -53,6 +62,10 @@ things to appear:
 That's the entire theming API. A theme is one HTML file a designer can read.
 
 ## Security notes
+
+- Optional two-factor authentication: turn it on in Settings and signing in
+  needs a six-digit code from any authenticator app as well as your password.
+  Eight one-time recovery codes cover a lost phone.
 
 - Passwords are stored with PHP's `password_hash` (bcrypt/argon2, never plain).
 - Every form is CSRF-protected; every query uses prepared statements.
