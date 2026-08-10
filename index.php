@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.5.0';
+const WREN_VERSION = '1.6.0';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -1812,6 +1812,20 @@ if ($q === '' && !empty($_SERVER['REQUEST_URI'])) {
 
 if (needs_setup()) {
     view_setup();
+}
+
+/* One address per page: with pretty URLs on, an explicit ?q= request is the
+   old-style twin of a clean path, so send it there permanently. Admin and
+   POSTs are left alone — this is only about what search engines index. */
+if (setting('pretty_urls') === '1'
+    && ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET'
+    && isset($_GET['q'])
+    && !str_starts_with($q, 'admin')) {
+    $extra = $_GET;
+    unset($extra['q']);
+    $target = url($q) . ($extra ? '?' . http_build_query($extra) : '');
+    header('Location: ' . $target, true, 301);
+    exit;
 }
 
 $seg = $q === '' ? [] : explode('/', $q);

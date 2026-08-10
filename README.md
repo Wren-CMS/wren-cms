@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.5.0 "Zeledoni" — stable · MIT licence
+Version 1.6.0 "Hypoleucus" — stable · MIT licence
 
 **Website:** <https://wrencms.com> · **Documentation:** <https://github.com/Wren-CMS/wren-cms/wiki>
 
@@ -27,6 +27,8 @@ Wren creates `wren.db` beside itself and signs you in. Done.
 **Optional:** upload `.htaccess` too (Apache with mod_rewrite), then switch on
 *Pretty URLs* in Settings to get `/my-article` instead of `/?q=my-article`.
 The `.htaccess` also blocks direct downloads of `wren.db` — recommended.
+With pretty URLs on, old `/?q=` addresses redirect to the clean ones, so each
+page has a single address search engines can settle on.
 On hosts without `.htaccess` support, keep Pretty URLs off and consider moving
 `wren.db` out of the web root once you're comfortable editing the `WREN_DB`
 constant at the top of the file.

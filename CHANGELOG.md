@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.0 "Hypoleucus" — 8 August 2026
+
+- New: with pretty URLs switched on, old-style /?q=slug addresses now redirect
+  permanently (301) to their clean equivalents, so every page has exactly one
+  address. Search engines that indexed the old form during setup will
+  consolidate onto the clean URLs; query strings such as ?pg=2 are preserved
+- The admin area is deliberately exempt, so existing /?q=admin bookmarks keep
+  working, and nothing redirects at all when pretty URLs are off
+
+
 ## 1.5.0 "Zeledoni" — 2 August 2026
 
 - New: optional two-factor authentication for the admin. Standard TOTP
