@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.6.0';
+const WREN_VERSION = '1.6.1';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -1814,14 +1814,20 @@ if (needs_setup()) {
     view_setup();
 }
 
-/* One address per page: with pretty URLs on, an explicit ?q= request is the
-   old-style twin of a clean path, so send it there permanently. Admin and
-   POSTs are left alone — this is only about what search engines index. */
+/* One address per page: with pretty URLs on, an old-style ?q= address is the
+   twin of a clean path, so send it there permanently.
+
+   Crucially this must read the *browser's* query string, not $_GET: mod_rewrite
+   turns /news into index.php?q=news, so $_GET['q'] is set on perfectly ordinary
+   clean-URL requests too, and redirecting on that would loop forever. Admin
+   paths and non-GET requests are exempt. */
+$sent_query = (string)parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_QUERY);
+parse_str($sent_query, $sent_params);
 if (setting('pretty_urls') === '1'
     && ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET'
-    && isset($_GET['q'])
+    && array_key_exists('q', $sent_params)
     && !str_starts_with($q, 'admin')) {
-    $extra = $_GET;
+    $extra = $sent_params;
     unset($extra['q']);
     $target = url($q) . ($extra ? '?' . http_build_query($extra) : '');
     header('Location: ' . $target, true, 301);

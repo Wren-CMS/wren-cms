@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.1 — 10 August 2026
+
+- Fix: 1.6.0's canonical redirect caused a redirect loop on hosts using the
+  supplied .htaccess. Rewriting turns /article into index.php?q=article, so
+  the redirect fired on ordinary clean-URL requests and bounced forever. The
+  check now reads the browser's own query string rather than the rewritten
+  one. Anyone on 1.6.0 with pretty URLs enabled should upgrade
+
+
 ## 1.6.0 "Hypoleucus" — 8 August 2026
 
 - New: with pretty URLs switched on, old-style /?q=slug addresses now redirect
