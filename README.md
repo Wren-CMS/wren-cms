@@ -88,3 +88,7 @@ in your head.
 *Named for the wren: a tiny bird with a very loud song. Built as a tribute to
 sNews by Luka Cvrk / Solucija, which proved twenty years ago that a CMS could
 be small enough to read.*
+
+## Who makes Wren
+
+Wren CMS is developed by Alan Paynter at 49 Systems (https://49systems.co.uk). Copyright 2026 Forty Nine Systems Ltd, released under the MIT licence: see LICENSE.
