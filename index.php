@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 0.1.0 "Troglodytes"
+ *  Version 1.6.1 "Hypoleucus"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -10,7 +10,7 @@
  *  scratch for the modern web: SQLite by default, hashed passwords, CSRF
  *  protection, prepared statements throughout, markdown editing.
  *
- *  Licence: MIT
+ *  Licence: MIT · Copyright (c) 2026 Forty Nine Systems Ltd · Developed by Alan Paynter, 49 Systems
  */
 
 declare(strict_types=1);
