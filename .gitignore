@@ -12,3 +12,7 @@ Wren*/
 Articles*/
 wiki/
 wren/
+
+# Starter packs and theme backups on a live site
+packs/
+theme-*.html.bak
