@@ -4,6 +4,8 @@ Options -Indexes
 <Files "wren.db">
   Require all denied
 </Files>
+# Starter packs are install files, not pages
+RedirectMatch 403 /packs/[^/]+\.json$
 RewriteEngine On
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
