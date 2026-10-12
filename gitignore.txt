@@ -1,0 +1,18 @@
+# Wren's database and SQLite journals — never commit a live site's data
+wren.db
+wren.db-wal
+wren.db-shm
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local downloads and unzipped releases — never commit these
+*.zip
+Wren*/
+Articles*/
+wiki/
+wren/
+
+# Starter packs and theme backups on a live site
+packs/
+theme-*.html.bak

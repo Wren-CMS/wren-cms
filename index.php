@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 1.6.1 "Hypoleucus"
+ *  Version 1.7.0 "Palustris"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.6.1';
+const WREN_VERSION = '1.7.0';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -617,11 +617,240 @@ function media_accept_upload(array $file, ?string &$error): ?string
     return $name;
 }
 
+/* ----------------------------------------------------------- starter packs */
+/* A starter pack is one JSON file: a theme, pages, menu links, articles,
+   settings and the business details its wording needs. Packs live in a
+   packs/ folder beside this file (or are uploaded in Settings → Starter
+   packs). Install fills [[tokens]] from a short form, so one pack becomes
+   anyone's site. Business details are also kept as settings, and theme.html
+   may use the same [[tokens]] — so a changed phone number updates the
+   header and footer without touching the theme. Format: see the wiki.      */
+
+const WREN_PACK_FORMAT = 1;
+
+function packs_dir(): string
+{
+    $dir = WREN_DIR . '/packs';
+    // Packs are install files, not web pages: keep them from being downloaded
+    // on Apache even if the folder was made by hand over FTP.
+    if (is_dir($dir) && !is_file($dir . '/.htaccess') && is_writable($dir)) {
+        @file_put_contents($dir . '/.htaccess', "Require all denied\n");
+    }
+    return $dir;
+}
+
+function pack_validate(mixed $p, ?string &$error): ?array
+{
+    $error = null;
+    if (!is_array($p) || (int)($p['wren_pack'] ?? 0) !== WREN_PACK_FORMAT) {
+        $error = 'That is not a Wren starter pack (format ' . WREN_PACK_FORMAT . ').';
+        return null;
+    }
+    $id = (string)($p['id'] ?? '');
+    if (!preg_match('/^[a-z0-9][a-z0-9-]{0,40}$/', $id) || trim((string)($p['name'] ?? '')) === '') {
+        $error = 'The pack needs a name and a short lowercase id.';
+        return null;
+    }
+    if (!empty($p['requires']) && version_compare(WREN_VERSION, (string)$p['requires'], '<')) {
+        $error = 'This pack needs Wren ' . $p['requires'] . ' or newer.';
+        return null;
+    }
+    foreach ($p['fields'] ?? [] as $f) {
+        if (!preg_match('/^[a-z][a-z0-9_]{0,30}$/', (string)($f['key'] ?? ''))) {
+            $error = 'A pack field has an invalid key.';
+            return null;
+        }
+    }
+    foreach (['pages', 'links', 'articles'] as $k) {
+        if (isset($p[$k]) && !is_array($p[$k])) {
+            $error = 'The pack\'s ' . $k . ' must be a list.';
+            return null;
+        }
+    }
+    if (isset($p['theme']) && !is_string($p['theme'])) {
+        $error = 'The pack\'s theme must be HTML text.';
+        return null;
+    }
+    return $p;
+}
+
+function pack_list(): array
+{
+    $out = [];
+    foreach (glob(packs_dir() . '/*.json') ?: [] as $file) {
+        $p = pack_validate(json_decode((string)file_get_contents($file), true), $err);
+        if ($p) {
+            $out[$p['id']] = $p;
+        }
+    }
+    ksort($out);
+    return $out;
+}
+
+function pack_load(string $id): ?array
+{
+    return pack_list()[$id] ?? null;
+}
+
+/* Derived values every pack can use without asking: a dialable phone number
+   and the year. */
+function pack_values(array $values): array
+{
+    if (isset($values['phone'])) {
+        $values['phone_link'] = preg_replace('/[^0-9+]/', '', $values['phone']);
+    }
+    $values['year'] = gmdate('Y');
+    return $values;
+}
+
+/* Replace [[key]] tokens. $escape for HTML/markdown bodies; titles and
+   settings stay plain because Wren escapes them on output. */
+function pack_fill(string $text, array $values, bool $escape): string
+{
+    return preg_replace_callback('/\[\[([a-z][a-z0-9_]*)\]\]/', function ($m) use ($values, $escape) {
+        if (!array_key_exists($m[1], $values)) {
+            return $m[0];
+        }
+        return $escape ? e($values[$m[1]]) : $values[$m[1]];
+    }, $text);
+}
+
+/* Business details saved by a pack install: [key => [label, value]] */
+function pack_fields(): array
+{
+    $f = json_decode(setting('pack_fields'), true);
+    return is_array($f) ? $f : [];
+}
+
+function pack_field_values(): array
+{
+    return pack_values(array_map(fn($f) => (string)($f['value'] ?? ''), pack_fields()));
+}
+
+function pack_install(array $pack, array $values, array $opt): array
+{
+    $values = pack_values($values);
+    $pdo = db();
+    $done = ['pages' => 0, 'links' => 0, 'articles' => 0];
+    $slugMap = [];  // pack slug => slug actually used
+    $idMap = [];    // pack slug => new post id
+
+    if (!empty($opt['theme']) && isset($pack['theme'])) {
+        $themeFile = WREN_DIR . '/theme.html';
+        if (is_file($themeFile)) {
+            copy($themeFile, WREN_DIR . '/theme-' . gmdate('Ymd-His') . '.html.bak');
+        }
+        // Tokens stay in the theme and are filled per request from settings.
+        if (file_put_contents($themeFile, $pack['theme']) === false) {
+            throw new RuntimeException('Could not write theme.html — check the folder is writable.');
+        }
+    }
+
+    $pdo->beginTransaction();
+    try {
+        if (!empty($opt['remove_sample'])) {
+            $pdo->exec('DELETE FROM posts WHERE slug = "hello-world" AND type = "article"');
+        }
+        // Settle every slug first, so bodies can link to each other with
+        // [[url_some_slug]] even when a slug had to change to stay unique.
+        $taken = [];
+        foreach (['pages', 'links', 'articles'] as $k) {
+            foreach ($pack[$k] ?? [] as $item) {
+                $want = slugify((string)($item['slug'] ?? pack_fill((string)($item['title'] ?? ''), $values, false)));
+                $slug = unique_slug($want);
+                for ($n = 2; isset($taken[$slug]); $n++) {
+                    $slug = unique_slug($want . '-' . $n);
+                }
+                $taken[$slug] = true;
+                $slugMap[$want] = $slug;
+                $values['url_' . str_replace('-', '_', $want)] = url($slug);
+            }
+        }
+        $ins = $pdo->prepare('INSERT INTO posts (type, slug, title, body, published, show_title, description,
+                              allow_comments, parent, newtab, position, created, updated)
+                              VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, ?, ?, ?, ?)');
+        $add = function (string $type, array $item, int $ageDays = 0) use ($ins, $values, &$slugMap, &$idMap, $pdo) {
+            $title = pack_fill((string)($item['title'] ?? 'Untitled'), $values, false);
+            $want = slugify((string)($item['slug'] ?? $title));
+            $slug = $slugMap[$want];
+            $when = gmdate('Y-m-d H:i:s', time() - $ageDays * 86400);
+            $isLink = $type === 'link';
+            $ins->execute([
+                $type, $slug, $title,
+                $isLink ? pack_fill((string)($item['url'] ?? ''), $values, false)
+                        : pack_fill((string)($item['body'] ?? ''), $values, true),
+                (int)($item['show_title'] ?? 1),
+                pack_fill((string)($item['description'] ?? ''), $values, false),
+                (int)($item['allow_comments'] ?? ($type === 'article' ? 1 : 0)),
+                (int)($item['newtab'] ?? 0),
+                (int)($item['position'] ?? 0),
+                $when, $when,
+            ]);
+            $idMap[$want] = (int)$pdo->lastInsertId();
+        };
+        foreach ($pack['pages'] ?? [] as $p) {
+            $add('page', $p);
+            $done['pages']++;
+        }
+        foreach ($pack['links'] ?? [] as $l) {
+            $add('link', $l);
+            $done['links']++;
+        }
+        foreach ($pack['articles'] ?? [] as $a) {
+            $add('article', $a, max(0, (int)($a['days_ago'] ?? 0)));
+            $done['articles']++;
+        }
+        // Second pass: menu parents, now that every item has an id.
+        $par = $pdo->prepare('UPDATE posts SET parent = ? WHERE id = ?');
+        foreach (array_merge($pack['pages'] ?? [], $pack['links'] ?? []) as $item) {
+            $parent = slugify((string)($item['parent'] ?? ''));
+            $self = slugify((string)($item['slug'] ?? pack_fill((string)($item['title'] ?? ''), $values, false)));
+            if (($item['parent'] ?? '') !== '' && isset($idMap[$parent], $idMap[$self])) {
+                $par->execute([$idMap[$parent], $idMap[$self]]);
+            }
+        }
+
+        $allowed = ['site_title', 'tagline', 'meta_description', 'og_image', 'blog_title', 'blog_slug',
+                    'blog_position', 'posts_per_page', 'comments', 'home_page'];
+        foreach ($pack['settings'] ?? [] as $name => $value) {
+            if (!in_array($name, $allowed, true)) {
+                continue;
+            }
+            $value = pack_fill((string)$value, $values, false);
+            if ($name === 'home_page') {
+                if (empty($opt['home'])) {
+                    continue;
+                }
+                $value = $slugMap[slugify($value)] ?? '';
+            }
+            if ($name === 'blog_slug') {
+                $value = slugify($value);
+            }
+            set_setting($name, $value);
+        }
+
+        $fields = [];
+        foreach ($pack['fields'] ?? [] as $f) {
+            $fields[$f['key']] = ['label' => (string)($f['label'] ?? $f['key']),
+                                  'value' => (string)($values[$f['key']] ?? '')];
+        }
+        set_setting('pack_fields', json_encode($fields));
+        set_setting('pack_installed', $pack['id'] . '@' . ($pack['version'] ?? '1'));
+        $pdo->commit();
+    } catch (Throwable $t) {
+        $pdo->rollBack();
+        throw $t;
+    }
+    return $done;
+}
+
 /* ------------------------------------------------------------- theme layer */
 /* If a file named theme.html sits beside this one, Wren uses it.
    Otherwise the built-in default below is used. Tags a theme may use:
    {{site_title}} {{tagline}} {{page_title}} {{menu}} {{content}}
-   {{home_url}} {{rss_url}} {{year}} {{generator}}                          */
+   {{home_url}} {{rss_url}} {{year}} {{generator}} {{seo_head}}
+   {{url:some-slug}} for a page's address, and [[key]] for any business
+   detail saved by a starter pack (e.g. [[phone]], [[email]]).              */
 
 function menu_html(string $activeSlug = ''): string
 {
@@ -689,6 +918,11 @@ function render(string $pageTitle, string $content, string $activeSlug = '', arr
 {
     $themeFile = WREN_DIR . '/theme.html';
     $theme = is_file($themeFile) ? (string)file_get_contents($themeFile) : default_theme();
+    // Business details from a starter pack ([[phone]] etc.) and page addresses
+    // ({{url:contact}}) — unknown [[tokens]] render as nothing.
+    $details = pack_field_values();
+    $theme = preg_replace_callback('/\[\[([a-z][a-z0-9_]*)\]\]/', fn($m) => e($details[$m[1]] ?? ''), $theme);
+    $theme = preg_replace_callback('/\{\{url:([a-z0-9-]*)\}\}/', fn($m) => e(url($m[1])), $theme);
 
     $siteTitle = setting('site_title', 'Wren');
 
@@ -1101,6 +1335,10 @@ function view_setup(): never
             $st->execute(["Welcome to **" . $site . "** — a brand-new site running on Wren.\n\nThis is your first article. Sign in to the [admin area](" . url('admin') . ") to edit or delete it, write something of your own, and add pages to the menu.", now(), now()]);
             $_SESSION['wren_user'] = $user;
             session_regenerate_id(true);
+            if (pack_list()) {
+                flash('Your site is live. Start from a ready-made design, or skip this and write your own.');
+                redirect(url('admin/packs'));
+            }
             flash('Welcome to Wren. Your site is live.');
             redirect(url('admin'));
         }
@@ -1662,6 +1900,152 @@ function twofactor_panel(): string
       </form>';
 }
 
+function view_admin_packs(string $id = ''): never
+{
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['form'] ?? '') === 'upload') {
+        csrf_check();
+        $f = $_FILES['pack'] ?? null;
+        $err = null;
+        if (!$f || ($f['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+            $err = 'Choose a starter pack (.json) to upload.';
+        } elseif (($f['size'] ?? 0) > 4 * 1024 * 1024) {
+            $err = 'That pack is larger than 4 MB.';
+        } else {
+            $p = pack_validate(json_decode((string)file_get_contents($f['tmp_name']), true), $err);
+            if ($p) {
+                if (!is_dir(WREN_DIR . '/packs') && !@mkdir(WREN_DIR . '/packs', 0755)) {
+                    $err = 'Could not create the packs folder — check the folder is writable.';
+                } elseif (!move_uploaded_file($f['tmp_name'], packs_dir() . '/' . $p['id'] . '.json')) {
+                    $err = 'The server could not save the pack.';
+                } else {
+                    flash('Pack "' . $p['name'] . '" is ready to install.');
+                    redirect(url('admin/packs/' . $p['id']));
+                }
+            }
+        }
+        flash($err ?? 'The upload failed.');
+        redirect(url('admin/packs'));
+    }
+
+    if ($id === '') {
+        $cards = '';
+        foreach (pack_list() as $p) {
+            $swatch = '';
+            foreach (array_slice((array)($p['swatches'] ?? []), 0, 5) as $c) {
+                if (preg_match('/^#[0-9a-fA-F]{3,8}$/', (string)$c)) {
+                    $swatch .= '<span style="display:inline-block;width:18px;height:18px;border-radius:50%;'
+                             . 'background:' . $c . ';border:1px solid var(--line);margin-right:4px"></span>';
+                }
+            }
+            $counts = count($p['pages'] ?? []) . ' pages · ' . count($p['articles'] ?? []) . ' articles';
+            $cards .= '<tr><td><b>' . e($p['name']) . '</b> <span class="muted">v' . e((string)($p['version'] ?? '1'))
+                    . '</span><br><span class="muted">' . e((string)($p['description'] ?? '')) . '</span>'
+                    . '<div style="margin-top:.4rem">' . $swatch . '<span class="muted">' . $counts . '</span></div></td>'
+                    . '<td class="actions"><a class="btn-link" href="' . e(url('admin/packs/' . $p['id'])) . '">Use this pack</a></td></tr>';
+        }
+        $installed = setting('pack_installed');
+        admin_shell('Starter packs', '
+          <h1>Starter packs</h1>
+          <p class="lede">A ready-made website for a kind of business: design, pages, menu and starter articles,
+            filled in with your details. Everything it creates can be edited afterwards like anything else.</p>
+          ' . ($installed !== '' ? '<p class="muted">Last installed: ' . e($installed) . '</p>' : '') . '
+          ' . ($cards ? '<table><tr><th>Pack</th><th></th></tr>' . $cards . '</table>'
+                      : '<p class="muted">No packs here yet. Upload one below, or place .json packs in a <code>packs</code> folder beside index.php.</p>') . '
+          <form method="post" enctype="multipart/form-data" class="upform">
+            ' . csrf_field() . '
+            <input type="hidden" name="form" value="upload">
+            <input type="file" name="pack" accept=".json,application/json">
+            <button>Upload pack</button>
+          </form>');
+    }
+
+    $pack = pack_load($id);
+    if (!$pack) {
+        flash('That starter pack could not be found.');
+        redirect(url('admin/packs'));
+    }
+    $fields = $pack['fields'] ?? [];
+    $err = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        csrf_check();
+        $values = [];
+        foreach ($fields as $f) {
+            $v = trim((string)($_POST['f'][$f['key']] ?? ''));
+            if ($v === '' && !empty($f['required']) && $err === '') {
+                $err = '"' . ($f['label'] ?? $f['key']) . '" is needed.';
+            }
+            $values[$f['key']] = $v;
+        }
+        if ($err === '' && empty($_POST['confirm'])) {
+            $err = 'Tick the box to confirm — installing adds pages and articles to this site.';
+        }
+        if ($err === '') {
+            try {
+                $done = pack_install($pack, $values, [
+                    'theme'         => !empty($_POST['theme']),
+                    'home'          => !empty($_POST['home']),
+                    'remove_sample' => !empty($_POST['remove_sample']),
+                ]);
+                flash('Installed "' . $pack['name'] . '": ' . $done['pages'] . ' pages, ' . $done['links']
+                    . ' menu links and ' . $done['articles'] . ' articles. Have a look, then make it yours.');
+                redirect(url('admin/pages'));
+            } catch (Throwable $t) {
+                $err = 'Nothing was installed: ' . $t->getMessage();
+            }
+        }
+    }
+    $rows = '';
+    foreach ($fields as $f) {
+        $k = $f['key'];
+        $val = $_POST['f'][$k] ?? ($f['example'] ?? '');
+        $hint = isset($f['hint']) ? ' <span class="hint">(' . e($f['hint']) . ')</span>' : '';
+        $input = !empty($f['multiline'])
+            ? '<textarea name="f[' . e($k) . ']" style="min-height:5rem">' . e((string)$val) . '</textarea>'
+            : '<input name="f[' . e($k) . ']" value="' . e((string)$val) . '"' . (!empty($f['required']) ? ' required' : '') . '>';
+        $rows .= '<label>' . e($f['label'] ?? $k) . $hint . ' ' . $input . '</label>';
+    }
+    $hasSample = (bool)post_by_slug('hello-world', false);
+    $posted = $_SERVER['REQUEST_METHOD'] === 'POST';
+    $chk = fn(string $n, bool $def) => ($posted ? !empty($_POST[$n]) : $def) ? 'checked' : '';
+    $writable = is_writable(is_file(WREN_DIR . '/theme.html') ? WREN_DIR . '/theme.html' : WREN_DIR);
+    admin_shell('Install ' . $pack['name'], '
+      <div class="topline"><h1>' . e($pack['name']) . '</h1><a href="' . e(url('admin/packs')) . '">All packs</a></div>
+      <p class="lede">' . e((string)($pack['description'] ?? '')) . '</p>
+      ' . ($err ? '<p class="err">' . e($err) . '</p>' : '') . '
+      <form method="post">
+        ' . csrf_field() . '
+        <p class="muted">Your details are written into the pages. The examples are filled in so you can see the
+          finished site straight away — change them now or later.</p>
+        ' . $rows . '
+        <label class="check"><input type="checkbox" name="theme" value="1" ' . $chk('theme', $writable)
+          . ($writable ? '' : ' disabled') . '> Use this pack\'s design
+          <span class="hint">(' . ($writable ? 'any current theme.html is kept as a dated .bak copy'
+                                              : 'the folder is not writable, so the design cannot be installed') . ')</span></label>
+        <label class="check"><input type="checkbox" name="home" value="1" ' . $chk('home', true) . '>
+          Make the pack\'s home page my homepage</label>
+        ' . ($hasSample ? '<label class="check"><input type="checkbox" name="remove_sample" value="1" '
+          . $chk('remove_sample', true) . '> Remove the "Hello, world" sample article</label>' : '') . '
+        <label class="check"><input type="checkbox" name="confirm" value="1"> I understand this adds pages,
+          menu links and articles to this site <span class="hint">(existing content is left alone)</span></label>
+        <button>Install pack</button>
+      </form>');
+}
+
+function business_details_fields(): string
+{
+    $pf = pack_fields();
+    if (!$pf) {
+        return '';
+    }
+    $out = '<h2 style="font-size:1rem;margin:1.8rem 0 0">Business details '
+         . '<span class="hint" style="font-weight:400">(used in your theme\'s header and footer)</span></h2>';
+    foreach ($pf as $k => $f) {
+        $out .= '<label>' . e((string)($f['label'] ?? $k)) . ' <input name="pf[' . e((string)$k) . ']" value="'
+              . e((string)($f['value'] ?? '')) . '"></label>';
+    }
+    return $out;
+}
+
 function view_admin_settings(): never
 {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -1731,6 +2115,14 @@ function view_admin_settings(): never
             $bs = slugify((string)($_POST['blog_slug'] ?? '') !== '' ? (string)$_POST['blog_slug'] : $bt);
             set_setting('blog_slug', $bs);
             set_setting('blog_position', (string)(int)($_POST['blog_position'] ?? 0));
+            if ($pf = pack_fields()) {
+                foreach ($pf as $k => $f) {
+                    if (isset($_POST['pf'][$k])) {
+                        $pf[$k]['value'] = trim((string)$_POST['pf'][$k]);
+                    }
+                }
+                set_setting('pack_fields', json_encode($pf));
+            }
             flash('Settings saved.');
         }
         redirect(url('admin/settings'));
@@ -1766,6 +2158,7 @@ function view_admin_settings(): never
           <label>Articles per page
             <input type="number" name="posts_per_page" min="1" value="' . e(setting('posts_per_page', '5')) . '"></label>
         </div>
+        ' . business_details_fields() . '
         <label class="check"><input type="checkbox" name="comments" value="1" '
           . (setting('comments', '1') === '1' ? 'checked' : '') . '>
           Allow comments on articles <span class="hint">(all comments are held for your approval)</span></label>
@@ -1777,6 +2170,10 @@ function view_admin_settings(): never
           Pretty URLs <span class="hint">(needs the .htaccess file from the Wren download)</span></label>
         <button>Save settings</button>
       </form>
+      <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">
+      <h1 style="font-size:1.2rem">Starter packs</h1>
+      <p class="muted">Ready-made designs and content for a kind of business.
+        <a href="' . e(url('admin/packs')) . '">Browse or install a starter pack &rarr;</a></p>
       <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">
       <h1 style="font-size:1.2rem">Change password</h1>
       <form method="post">
@@ -1856,6 +2253,7 @@ if (($seg[0] ?? '') === 'admin') {
         $sub === 'media'    => view_admin_media(),
         $sub === 'comments' => view_admin_comments(),
         $sub === 'settings' => view_admin_settings(),
+        $sub === 'packs'    => view_admin_packs(preg_replace('/[^a-z0-9-]/', '', $seg[2] ?? '')),
         $sub === 'save'     => admin_save(),
         $sub === 'delete'   => admin_delete(),
         $sub === 'new'      => view_admin_edit(null, in_array($seg[2] ?? '', ['page', 'link'], true) ? $seg[2] : 'article'),

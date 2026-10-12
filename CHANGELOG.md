@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.7.0 "Palustris" — 12 October 2026
+
+- New: starter packs. A pack is one JSON file holding a theme, pages (with
+  menu parents), menu links, starter articles and settings. Settings →
+  Starter packs lists the packs in a `packs` folder beside index.php and
+  accepts uploads; installing fills the pack's [[tokens]] from a short form
+  of business details, with examples pre-filled so a demo is one click
+- Installs run in a single transaction and never overwrite: clashing slugs
+  get a suffix (and the pack's own cross-links follow them), and any
+  existing theme.html is kept as theme-YYYYMMDD-HHMMSS.html.bak
+- On a fresh install, if packs are present, setup hands over to the packs
+  screen so a new site can start from a ready-made design
+- New: Business details in Settings (after a pack install). Themes can show
+  them with [[key]] tags, e.g. [[phone]], and [[phone_link]] gives a
+  dialable tel: number, so header and footer details are edited in one place
+- The packs folder is shielded from download: Wren adds its own .htaccess
+  to it, and the supplied .htaccess refuses /packs/*.json as well
+- New theme tag {{url:slug}} for linking to a page from a theme, e.g. a
+  footer privacy link, that works with or without pretty URLs
+
+
 ## 1.6.1 — 10 August 2026
 
 - Fix: 1.6.0's canonical redirect caused a redirect loop on hosts using the

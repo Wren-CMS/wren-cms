@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.6.1 "Hypoleucus" — stable · MIT licence
+Version 1.7.0 "Palustris" — stable · MIT licence
 
 **Website:** <https://wrencms.com> · **Documentation:** <https://github.com/Wren-CMS/wren-cms/wiki>
 
@@ -64,7 +64,27 @@ things to appear:
     {{site_title}}  {{tagline}}   {{page_title}}  {{menu}}
     {{content}}     {{home_url}}  {{rss_url}}     {{year}}  {{generator}}
 
+Two more for linking and business details:
+
+    {{url:contact}}   the address of the page with that slug
+    [[phone]]         any business detail saved by a starter pack
+
 That's the entire theming API. A theme is one HTML file a designer can read.
+
+## Starter packs
+
+A starter pack is a ready-made website for a kind of business — a theme,
+pages, menu, starter articles and settings — in a single `.json` file. Put
+packs in a `packs` folder beside `index.php`, or upload one under
+**Settings → Starter packs**. Installing asks for a few details (business
+name, town, phone…), writes them into the pages, and can switch the design,
+set the homepage and remove the sample article. Nothing existing is
+overwritten: clashing addresses get a `-2` suffix and an old `theme.html` is
+kept as a dated `.bak` copy.
+
+The details are also saved as **Business details** in Settings, so a theme's
+header and footer stay current when a phone number changes. The pack format
+is documented in the wiki.
 
 ## Security notes
 
