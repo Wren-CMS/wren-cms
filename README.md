@@ -61,3 +61,4 @@ Named for the wren: a tiny bird with a very loud song. Built as a tribute to sNe
 
 Who makes Wren
 Wren CMS is developed by Alan Paynter at 49 Systems (https://49systems.co.uk). Copyright 2026 Forty Nine Systems Ltd, released under the MIT licence: see LICENSE.
+Systems (https://49systems.co.uk). Copyright 2026 Forty Nine Systems Ltd, released under the MIT licence: see LICENSE.
