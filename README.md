@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.7.0 "Palustris" — stable · MIT licence
+Version 1.8.0 "Mexicanus" — stable · MIT licence
 
 **Website:** <https://wrencms.com> · **Documentation:** <https://github.com/Wren-CMS/wren-cms/wiki>
 
@@ -44,7 +44,14 @@ constant at the top of the file.
   `[links](https://…)`, `![images](https://…)`, lists, quotes, and fenced
   code blocks. Raw HTML passes through untouched — you're the admin, so
   Wren trusts you.
-- Untick *Published* to keep something as a draft only you can see.
+- Untick *Published* to keep something as a draft only you can see. An
+  article is dated the moment it's first published, not when the draft was
+  started.
+- **Scheduled articles:** set *Publish on* to a future date and time and the
+  article goes live by itself then, dated to the minute you chose — no cron
+  job needed. Scheduled articles show in the admin list as
+  "Scheduled · 4 Nov 09:00". Times use the *Timezone* in Settings
+  (Europe/London by default).
 - **Images:** upload JPG, PNG, GIF or WebP in the admin's Media tab, then click
   an image's address to copy ready-made markdown into any post.
 - **Comments:** readers can comment on articles (and pages, if you opt one

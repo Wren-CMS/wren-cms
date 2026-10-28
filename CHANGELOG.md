@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.8.0 "Mexicanus" — 28 October 2026
+
+- Fix: articles are now dated when they are published, not when the draft
+  was first saved. A draft started last week and published today shows,
+  sorts and appears in RSS under today's date. Editing an already-published
+  article keeps its date; pages and menu links are unaffected. Unpublishing
+  and republishing an article moves its date to the republish
+- New: scheduled publishing for articles. Set "Publish on" in the editor to
+  a future date and time and the article publishes itself then, taking that
+  time as its date. Scheduled articles stay hidden until due and show as
+  "Scheduled · 4 Nov 09:00" in the admin list. A time now or in the past
+  publishes straight away; clearing the field un-schedules
+- No cron job needed: each visit makes one cheap indexed check for articles
+  that are due, so an ordinary request writes nothing. Publishing is safe
+  when two visits arrive together (each post goes out, and is pinged to
+  IndexNow, exactly once)
+- New setting: Timezone (default Europe/London), used to enter and show
+  scheduled times; times are stored in UTC, so clock changes are handled
+- Database: adds posts.publish_at, applied automatically on first visit
+
+
 ## 1.7.0 "Palustris" — 12 October 2026
 
 - New: starter packs. A pack is one JSON file holding a theme, pages (with

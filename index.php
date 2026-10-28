@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 1.7.0 "Palustris"
+ *  Version 1.8.0 "Mexicanus"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.7.0';
+const WREN_VERSION = '1.8.0';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -70,6 +70,11 @@ function wren_migrate(PDO $pdo): void
         $pdo->exec('ALTER TABLE posts ADD COLUMN allow_comments INTEGER NOT NULL DEFAULT 1');
         $pdo->exec('UPDATE posts SET allow_comments = 0 WHERE type = "page"');
     }
+    if ($cols && !in_array('publish_at', $cols, true)) {
+        // UTC 'Y-m-d H:i:s' when an article is scheduled; "" means not scheduled
+        $pdo->exec('ALTER TABLE posts ADD COLUMN publish_at TEXT NOT NULL DEFAULT ""');
+    }
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_posts_due ON posts (published, publish_at)');
     $ucols = array_column($pdo->query('PRAGMA table_info(users)')->fetchAll(), 'name');
     if ($ucols && !in_array('totp_secret', $ucols, true)) {
         $pdo->exec('ALTER TABLE users ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ""');
@@ -114,6 +119,7 @@ function wren_schema(PDO $pdo): void
             parent    INTEGER NOT NULL DEFAULT 0,
             newtab    INTEGER NOT NULL DEFAULT 0,
             position  INTEGER NOT NULL DEFAULT 0,
+            publish_at TEXT NOT NULL DEFAULT "",
             created   TEXT NOT NULL,
             updated   TEXT NOT NULL
         );
@@ -127,6 +133,7 @@ function wren_schema(PDO $pdo): void
             ip       TEXT NOT NULL DEFAULT ""
         );
         CREATE INDEX IF NOT EXISTS idx_posts_type ON posts (type, published, created);
+        CREATE INDEX IF NOT EXISTS idx_posts_due ON posts (published, publish_at);
         CREATE INDEX IF NOT EXISTS idx_comments_post ON comments (post_id, approved, created);
     ');
 }
@@ -171,6 +178,47 @@ function e(?string $s): string
 function now(): string
 {
     return gmdate('Y-m-d H:i:s');
+}
+
+/* Times are stored in UTC. The Timezone setting is only used to read and show
+   a scheduled publish time; visible article dates stay as they always were. */
+function site_tz(): DateTimeZone
+{
+    try {
+        return new DateTimeZone(setting('timezone', 'Europe/London'));
+    } catch (Exception) {
+        return new DateTimeZone('Europe/London');
+    }
+}
+
+function utc_to_local(string $utc, string $format): string
+{
+    return (new DateTime($utc, new DateTimeZone('UTC')))->setTimezone(site_tz())->format($format);
+}
+
+/* "Wed 4 November, 09:00" (long) or "4 Nov 09:00" (short) for a scheduled
+   time, with the year added only when it isn't this year. */
+function schedule_label(string $utc, bool $long = false): string
+{
+    $sameYear = utc_to_local($utc, 'Y') === (new DateTime('now', site_tz()))->format('Y');
+    return $long
+        ? utc_to_local($utc, $sameYear ? 'D j F, H:i' : 'D j F Y, H:i')
+        : utc_to_local($utc, $sameYear ? 'j M H:i' : 'j M Y H:i');
+}
+
+/* A datetime-local value ("2026-11-04T09:00") in the site timezone → UTC, or
+   null when it can't be read. Out-of-range values such as 31 February are
+   refused rather than quietly rolled into March. */
+function local_to_utc(string $local): ?string
+{
+    foreach (['Y-m-d\TH:i', 'Y-m-d\TH:i:s', 'Y-m-d H:i', 'Y-m-d H:i:s'] as $f) {
+        $d = DateTime::createFromFormat('!' . $f, $local, site_tz());
+        $errs = DateTime::getLastErrors();
+        if ($d && (!$errs || ($errs['warning_count'] === 0 && $errs['error_count'] === 0))) {
+            return $d->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+        }
+    }
+    return null;
 }
 
 function slugify(string $s): string
@@ -499,6 +547,36 @@ function indexnow_ping(array $urls): void
         'ignore_errors' => true,
     ]]);
     @file_get_contents(setting('indexnow_endpoint', 'https://api.indexnow.org/indexnow'), false, $ctx);
+}
+
+/* ------------------------------------------------------ scheduled publishing */
+/* No cron: every request, public or admin, checks for articles whose time has
+   come. The check is one indexed SELECT, so nothing is written on ordinary
+   requests. A published post takes its scheduled time as its date, not the
+   moment someone happened to visit. "AND published = 0" on the UPDATE means
+   two simultaneous requests can't both publish (or both ping) the same post. */
+function publish_due(): void
+{
+    $st = db()->prepare('SELECT id, slug FROM posts WHERE published = 0 AND publish_at != ""
+                         AND publish_at <= ? LIMIT 20');
+    $st->execute([now()]);
+    $due = $st->fetchAll();
+    if (!$due) {
+        return;
+    }
+    $up = db()->prepare('UPDATE posts SET published = 1, created = publish_at, updated = ?,
+                         publish_at = "" WHERE id = ? AND published = 0');
+    $urls = [];
+    foreach ($due as $p) {
+        $up->execute([now(), $p['id']]);
+        if ($up->rowCount() > 0) {
+            $urls[] = abs_url($p['slug']);
+        }
+    }
+    if ($urls) {
+        $urls[] = abs_url();
+        indexnow_ping($urls);
+    }
 }
 
 /* ------------------------------------------------------------------ posts */
@@ -1550,7 +1628,9 @@ function view_admin_list(string $type): never
     $st->execute([$type]);
     $rows = '';
     foreach ($st as $p) {
-        $badge = $p['published'] ? '' : '<span class="draft">draft</span>';
+        $badge = $p['published'] ? '' : ($p['publish_at'] !== ''
+            ? '<span class="draft">Scheduled &middot; ' . e(schedule_label($p['publish_at'])) . '</span>'
+            : '<span class="draft">draft</span>');
         $rows .= '<tr>
             <td><a href="' . e(url('admin/edit/' . $p['id'])) . '">' . e($p['title']) . '</a>' . $badge . '</td>
             <td class="muted">' . e(gmdate('j M Y', strtotime($p['created']))) . '</td>
@@ -1631,6 +1711,12 @@ function view_admin_edit(?array $post, string $type): never
              . (($post['show_title'] ?? 1) ? 'checked' : '') . '>
              Show title on the page <span class="hint">(untick for a homepage)</span></label>'
         : '';
+    $scheduleField = $type === 'article'
+        ? '<label>Publish on <span class="hint">(' . e(site_tz()->getName()) . ' time)</span>
+             <input type="datetime-local" name="publish_at" value="'
+             . e(($post['publish_at'] ?? '') !== '' ? utc_to_local($post['publish_at'], 'Y-m-d\TH:i') : '') . '">
+             <span class="hint">Leave blank to publish immediately when Published is ticked.</span></label>'
+        : '';
     admin_shell($isNew ? "New $one" : 'Edit', '
       <h1>' . ($isNew ? "New $one" : 'Edit ' . $one) . '</h1>
       <form method="post" action="' . e(url('admin/save')) . '">
@@ -1647,6 +1733,7 @@ function view_admin_edit(?array $post, string $type): never
           <textarea name="body">' . e($post['body'] ?? '') . '</textarea></label>
         <label class="check"><input type="checkbox" name="published" value="1" '
           . (($post['published'] ?? 1) ? 'checked' : '') . '> Published</label>
+        ' . $scheduleField . '
         <label class="check"><input type="checkbox" name="allow_comments" value="1" '
           . (($post['allow_comments'] ?? ($type === 'article' ? 1 : 0)) ? 'checked' : '') . '>
           Allow comments <span class="hint">(also requires comments to be on in Settings)</span></label>
@@ -1689,12 +1776,37 @@ function admin_save(): never
         flash('A title is required.');
         redirect(url($id ? 'admin/edit/' . $id : 'admin/new/' . $type));
     }
+    // Articles only: a future "Publish on" schedules the post (published stays
+    // 0 whatever the tick box says); now or past publishes straight away.
+    $publishAt = '';
+    $rawWhen = $type === 'article' ? trim((string)($_POST['publish_at'] ?? '')) : '';
+    if ($rawWhen !== '') {
+        $utc = local_to_utc($rawWhen);
+        if ($utc === null) {
+            flash('The "Publish on" date and time could not be read — pick it again, or leave it blank.');
+            redirect(url($id ? 'admin/edit/' . $id : 'admin/new/' . $type));
+        }
+        if ($utc > now()) {
+            $publishAt = $utc;
+            $published = 0;
+        } else {
+            $published = 1;
+        }
+    }
     if ($id) {
+        // An article going from unpublished to published is dated now, so a
+        // draft written last week shows the day it went out. Read the old state
+        // from the database, not the form. Editing a published article keeps
+        // its date; pages and links are untouched.
+        $st = db()->prepare('SELECT type, published FROM posts WHERE id = ?');
+        $st->execute([$id]);
+        $old = $st->fetch();
+        $redate = $old && $old['type'] === 'article' && !(int)$old['published'] && $published;
         $st = db()->prepare('UPDATE posts SET title=?, slug=?, body=?, published=?, position=?,
                              show_title=?, description=?, allow_comments=?, parent=?, newtab=?,
-                             updated=? WHERE id=?');
+                             publish_at=?, created=COALESCE(?, created), updated=? WHERE id=?');
         $st->execute([$title, $slug, $body, $published, $position, $showTitle, $description,
-                      $allowComments, $parent, $newtab, now(), $id]);
+                      $allowComments, $parent, $newtab, $publishAt, $redate ? now() : null, now(), $id]);
         if ($parent > 0) {
             // one level deep: a page that becomes a child passes its children to the top
             db()->prepare('UPDATE posts SET parent = 0 WHERE parent = ?')->execute([$id]);
@@ -1702,11 +1814,15 @@ function admin_save(): never
         flash('Saved.');
     } else {
         $st = db()->prepare('INSERT INTO posts (type, slug, title, body, published, position,
-                             show_title, description, allow_comments, parent, newtab, created, updated)
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
+                             show_title, description, allow_comments, parent, newtab, publish_at,
+                             created, updated)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
         $st->execute([$type, $slug, $title, $body, $published, $position, $showTitle, $description,
-                      $allowComments, $parent, $newtab, now(), now()]);
+                      $allowComments, $parent, $newtab, $publishAt, now(), now()]);
         flash(ucfirst($type) . ' created.');
+    }
+    if ($publishAt !== '') {
+        flash('Scheduled for ' . schedule_label($publishAt, true) . '.');
     }
     if ($published && $type !== 'link') {
         indexnow_ping([abs_url($slug === setting('home_page') ? '' : $slug), abs_url()]);
@@ -2100,6 +2216,10 @@ function view_admin_settings(): never
             set_setting('site_title', trim((string)($_POST['site_title'] ?? 'Wren')));
             set_setting('tagline', trim((string)($_POST['tagline'] ?? '')));
             set_setting('posts_per_page', (string)max(1, (int)($_POST['posts_per_page'] ?? 5)));
+            $tz = (string)($_POST['timezone'] ?? '');
+            if (in_array($tz, timezone_identifiers_list(), true)) {
+                set_setting('timezone', $tz);
+            }
             set_setting('pretty_urls', isset($_POST['pretty_urls']) ? '1' : '0');
             set_setting('meta_description', trim((string)($_POST['meta_description'] ?? '')));
             set_setting('og_image', trim((string)($_POST['og_image'] ?? '')));
@@ -2133,6 +2253,11 @@ function view_admin_settings(): never
         $sel = setting('home_page') === $p['slug'] ? ' selected' : '';
         $opts .= '<option value="' . e($p['slug']) . '"' . $sel . '>' . e($p['title']) . '</option>';
     }
+    $tzOpts = '';
+    $tzNow = site_tz()->getName();
+    foreach (timezone_identifiers_list() as $tz) {
+        $tzOpts .= '<option' . ($tz === $tzNow ? ' selected' : '') . '>' . e($tz) . '</option>';
+    }
     admin_shell('Settings', '
       <h1>Settings</h1>
       <form method="post">
@@ -2157,6 +2282,8 @@ function view_admin_settings(): never
         <div class="row">
           <label>Articles per page
             <input type="number" name="posts_per_page" min="1" value="' . e(setting('posts_per_page', '5')) . '"></label>
+          <label>Timezone <span class="hint">(for scheduled publishing)</span>
+            <select name="timezone">' . $tzOpts . '</select></label>
         </div>
         ' . business_details_fields() . '
         <label class="check"><input type="checkbox" name="comments" value="1" '
@@ -2210,6 +2337,8 @@ if ($q === '' && !empty($_SERVER['REQUEST_URI'])) {
 if (needs_setup()) {
     view_setup();
 }
+
+publish_due();
 
 /* One address per page: with pretty URLs on, an old-style ?q= address is the
    twin of a clean path, so send it there permanently.
