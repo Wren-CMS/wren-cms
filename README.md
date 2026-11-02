@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.8.0 "Mexicanus" — stable · MIT licence
+Version 1.9.0 "Obsoletus" — stable · MIT licence
 
 **Website:** <https://wrencms.com> · **Documentation:** <https://github.com/Wren-CMS/wren-cms/wiki>
 
@@ -52,6 +52,11 @@ constant at the top of the file.
   job needed. Scheduled articles show in the admin list as
   "Scheduled · 4 Nov 09:00". Times use the *Timezone* in Settings
   (Europe/London by default).
+- **Hide from search engines:** tick it on any page or article that exists
+  only to be landed on, such as a form's thank-you page. Wren adds a
+  `noindex` tag, leaves it out of `sitemap.xml` and doesn't ping IndexNow
+  for it. It still works for anyone with the link, and articles stay in the
+  RSS feed.
 - **Images:** upload JPG, PNG, GIF or WebP in the admin's Media tab, then click
   an image's address to copy ready-made markdown into any post.
 - **Comments:** readers can comment on articles (and pages, if you opt one

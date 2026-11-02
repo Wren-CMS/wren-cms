@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.0 "Obsoletus" — 2 November 2026
+
+- New: "Hide from search engines" on any page or article. It adds a noindex
+  tag, leaves the page out of sitemap.xml and skips the IndexNow ping. The
+  page still works for anyone with the link
+- Hidden pages and articles show a "hidden from search" tag in the admin
+  lists. Articles hidden from search still appear in the RSS feed
+- Database: adds a noindex column automatically on first load
+
+
 ## 1.8.0 "Mexicanus" — 28 October 2026
 
 - Fix: articles are now dated when they are published, not when the draft

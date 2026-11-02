@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 1.8.0 "Mexicanus"
+ *  Version 1.9.0 "Obsoletus"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.8.0';
+const WREN_VERSION = '1.9.0';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -74,6 +74,10 @@ function wren_migrate(PDO $pdo): void
         // UTC 'Y-m-d H:i:s' when an article is scheduled; "" means not scheduled
         $pdo->exec('ALTER TABLE posts ADD COLUMN publish_at TEXT NOT NULL DEFAULT ""');
     }
+    if ($cols && !in_array('noindex', $cols, true)) {
+        // 1 = hidden from search engines (robots noindex, no sitemap, no IndexNow)
+        $pdo->exec('ALTER TABLE posts ADD COLUMN noindex INTEGER NOT NULL DEFAULT 0');
+    }
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_posts_due ON posts (published, publish_at)');
     $ucols = array_column($pdo->query('PRAGMA table_info(users)')->fetchAll(), 'name');
     if ($ucols && !in_array('totp_secret', $ucols, true)) {
@@ -120,6 +124,7 @@ function wren_schema(PDO $pdo): void
             newtab    INTEGER NOT NULL DEFAULT 0,
             position  INTEGER NOT NULL DEFAULT 0,
             publish_at TEXT NOT NULL DEFAULT "",
+            noindex   INTEGER NOT NULL DEFAULT 0,
             created   TEXT NOT NULL,
             updated   TEXT NOT NULL
         );
@@ -557,7 +562,7 @@ function indexnow_ping(array $urls): void
    two simultaneous requests can't both publish (or both ping) the same post. */
 function publish_due(): void
 {
-    $st = db()->prepare('SELECT id, slug FROM posts WHERE published = 0 AND publish_at != ""
+    $st = db()->prepare('SELECT id, slug, noindex FROM posts WHERE published = 0 AND publish_at != ""
                          AND publish_at <= ? LIMIT 20');
     $st->execute([now()]);
     $due = $st->fetchAll();
@@ -569,8 +574,8 @@ function publish_due(): void
     $urls = [];
     foreach ($due as $p) {
         $up->execute([now(), $p['id']]);
-        if ($up->rowCount() > 0) {
-            $urls[] = abs_url($p['slug']);
+        if ($up->rowCount() > 0 && !(int)$p['noindex']) {
+            $urls[] = abs_url($p['slug']); // posts hidden from search are never pinged
         }
     }
     if ($urls) {
@@ -1012,7 +1017,13 @@ function render(string $pageTitle, string $content, string $activeSlug = '', arr
         $canonical .= (str_contains($canonical, '?') ? '&' : '?') . 'pg=' . (int)$seo['pg'];
     }
     $head  = '<meta name="description" content="' . e($desc) . '">' . "\n";
-    $head .= '<link rel="canonical" href="' . e($canonical) . '">' . "\n";
+    if (!empty($seo['noindex'])) {
+        // Hidden from search engines: ask them not to index it, and don't claim
+        // a canonical address for a page that shouldn't be in their results.
+        $head .= '<meta name="robots" content="noindex, follow">' . "\n";
+    } else {
+        $head .= '<link rel="canonical" href="' . e($canonical) . '">' . "\n";
+    }
     $head .= '<meta property="og:site_name" content="' . e($siteTitle) . '">' . "\n";
     $head .= '<meta property="og:type" content="' . e($seo['type'] ?? 'website') . '">' . "\n";
     $head .= '<meta property="og:title" content="' . e($fullTitle) . '">' . "\n";
@@ -1324,6 +1335,7 @@ function view_post(array $post, bool $asHome = false): never
         'description' => trim($post['description'] ?? '') ?: excerpt($post['body'], 158),
         'route'       => $asHome ? '' : $post['slug'],
         'type'        => $post['type'] === 'article' ? 'article' : 'website',
+        'noindex'     => (int)($post['noindex'] ?? 0) === 1,
     ]);
 }
 
@@ -1367,11 +1379,14 @@ function view_sitemap(): never
     echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n";
     echo '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
     $homePage = setting('home_page');
-    echo '<url><loc>' . e(abs_url()) . '</loc></url>' . "\n";
+    $hp = $homePage !== '' ? post_by_slug($homePage) : null;
+    if (!$hp || !(int)$hp['noindex']) {
+        echo '<url><loc>' . e(abs_url()) . '</loc></url>' . "\n";
+    }
     if ($homePage !== '') {
         echo '<url><loc>' . e(abs_url(setting('blog_slug', 'blog'))) . '</loc></url>' . "\n";
     }
-    $st = db()->query('SELECT slug, updated FROM posts WHERE published = 1
+    $st = db()->query('SELECT slug, updated FROM posts WHERE published = 1 AND noindex = 0
                        AND type IN ("article", "page") ORDER BY type, created');
     foreach ($st as $p) {
         if ($p['slug'] === $homePage) {
@@ -1631,6 +1646,9 @@ function view_admin_list(string $type): never
         $badge = $p['published'] ? '' : ($p['publish_at'] !== ''
             ? '<span class="draft">Scheduled &middot; ' . e(schedule_label($p['publish_at'])) . '</span>'
             : '<span class="draft">draft</span>');
+        if ((int)$p['noindex']) {
+            $badge .= '<span class="draft">hidden from search</span>';
+        }
         $rows .= '<tr>
             <td><a href="' . e(url('admin/edit/' . $p['id'])) . '">' . e($p['title']) . '</a>' . $badge . '</td>
             <td class="muted">' . e(gmdate('j M Y', strtotime($p['created']))) . '</td>
@@ -1737,6 +1755,9 @@ function view_admin_edit(?array $post, string $type): never
         <label class="check"><input type="checkbox" name="allow_comments" value="1" '
           . (($post['allow_comments'] ?? ($type === 'article' ? 1 : 0)) ? 'checked' : '') . '>
           Allow comments <span class="hint">(also requires comments to be on in Settings)</span></label>
+        <label class="check"><input type="checkbox" name="noindex" value="1" '
+          . (($post['noindex'] ?? 0) ? 'checked' : '') . '>
+          Hide from search engines <span class="hint">(still visible to anyone with the link)</span></label>
         <button>' . ($isNew ? 'Create' : 'Save changes') . '</button>
       </form>');
 }
@@ -1755,6 +1776,7 @@ function admin_save(): never
     $showTitle = ($type === 'page' && !isset($_POST['show_title'])) ? 0 : 1;
     $description = trim((string)($_POST['description'] ?? ''));
     $allowComments = isset($_POST['allow_comments']) ? 1 : 0;
+    $noindex = ($type !== 'link' && isset($_POST['noindex'])) ? 1 : 0;
     $newtab = isset($_POST['newtab']) ? 1 : 0;
     $parent = (int)($_POST['parent'] ?? 0);
     if ($parent > 0) {
@@ -1804,9 +1826,10 @@ function admin_save(): never
         $redate = $old && $old['type'] === 'article' && !(int)$old['published'] && $published;
         $st = db()->prepare('UPDATE posts SET title=?, slug=?, body=?, published=?, position=?,
                              show_title=?, description=?, allow_comments=?, parent=?, newtab=?,
-                             publish_at=?, created=COALESCE(?, created), updated=? WHERE id=?');
+                             publish_at=?, noindex=?, created=COALESCE(?, created), updated=? WHERE id=?');
         $st->execute([$title, $slug, $body, $published, $position, $showTitle, $description,
-                      $allowComments, $parent, $newtab, $publishAt, $redate ? now() : null, now(), $id]);
+                      $allowComments, $parent, $newtab, $publishAt, $noindex, $redate ? now() : null,
+                      now(), $id]);
         if ($parent > 0) {
             // one level deep: a page that becomes a child passes its children to the top
             db()->prepare('UPDATE posts SET parent = 0 WHERE parent = ?')->execute([$id]);
@@ -1815,16 +1838,16 @@ function admin_save(): never
     } else {
         $st = db()->prepare('INSERT INTO posts (type, slug, title, body, published, position,
                              show_title, description, allow_comments, parent, newtab, publish_at,
-                             created, updated)
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+                             noindex, created, updated)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
         $st->execute([$type, $slug, $title, $body, $published, $position, $showTitle, $description,
-                      $allowComments, $parent, $newtab, $publishAt, now(), now()]);
+                      $allowComments, $parent, $newtab, $publishAt, $noindex, now(), now()]);
         flash(ucfirst($type) . ' created.');
     }
     if ($publishAt !== '') {
         flash('Scheduled for ' . schedule_label($publishAt, true) . '.');
     }
-    if ($published && $type !== 'link') {
+    if ($published && $type !== 'link' && !$noindex) {
         indexnow_ping([abs_url($slug === setting('home_page') ? '' : $slug), abs_url()]);
     }
     redirect(url(['page' => 'admin/pages', 'link' => 'admin/links'][$type] ?? 'admin'));
@@ -1834,12 +1857,12 @@ function admin_delete(): never
 {
     csrf_check();
     $id = (int)($_POST['id'] ?? 0);
-    $st = db()->prepare('SELECT type, slug FROM posts WHERE id = ?');
+    $st = db()->prepare('SELECT type, slug, noindex FROM posts WHERE id = ?');
     $st->execute([$id]);
     $p = $st->fetch();
     if ($p) {
         db()->prepare('DELETE FROM posts WHERE id = ?')->execute([$id]);
-        if ($p['type'] !== 'link') {
+        if ($p['type'] !== 'link' && !(int)$p['noindex']) {
             indexnow_ping([abs_url($p['slug']), abs_url()]);
         }
         flash('Deleted.');
@@ -1866,13 +1889,15 @@ function view_admin_comments(): never
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         csrf_check();
         $id = (int)($_POST['id'] ?? 0);
-        $st = db()->prepare('SELECT c.*, p.slug FROM comments c JOIN posts p ON p.id = c.post_id
+        $st = db()->prepare('SELECT c.*, p.slug, p.noindex FROM comments c JOIN posts p ON p.id = c.post_id
                              WHERE c.id = ?');
         $st->execute([$id]);
         $c = $st->fetch();
         if ($c && ($_POST['action'] ?? '') === 'approve') {
             db()->prepare('UPDATE comments SET approved = 1 WHERE id = ?')->execute([$id]);
-            indexnow_ping([abs_url($c['slug'])]);
+            if (!(int)$c['noindex']) {
+                indexnow_ping([abs_url($c['slug'])]);
+            }
             flash('Approved.');
         } elseif ($c && ($_POST['action'] ?? '') === 'delete') {
             db()->prepare('DELETE FROM comments WHERE id = ?')->execute([$id]);
