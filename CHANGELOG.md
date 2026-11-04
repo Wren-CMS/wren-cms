@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.10.0 "Arada" — 4 November 2026
+
+- New: Wren tells you when a new version is out. The admin shows a notice
+  with a link to download it from GitHub; updating is still a matter of
+  replacing index.php
+- Settings shows the version you have and when Wren last checked, with a
+  "Check now" button and a switch to turn update checks off
+- The check asks GitHub for the latest release at most twice a day, and only
+  from the admin, so public pages are never slowed down. A slow or
+  unreachable GitHub delays an admin page by three seconds at most, and a
+  failed check is retried after an hour
+
+
 ## 1.9.0 "Obsoletus" — 2 November 2026
 
 - New: "Hide from search engines" on any page or article. It adds a noindex

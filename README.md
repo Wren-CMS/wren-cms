@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.9.0 "Obsoletus" — stable · MIT licence
+Version 1.10.0 "Arada" — stable · MIT licence
 
 **Website:** <https://wrencms.com> · **Documentation:** <https://github.com/Wren-CMS/wren-cms/wiki>
 
@@ -32,6 +32,18 @@ page has a single address search engines can settle on.
 On hosts without `.htaccess` support, keep Pretty URLs off and consider moving
 `wren.db` out of the web root once you're comfortable editing the `WREN_DB`
 constant at the top of the file.
+
+## Updating
+
+Replace `index.php` with the new one and visit your site; any database
+changes are made automatically on that first visit. Your content, settings,
+theme and uploads are never touched.
+
+Wren tells you when there's a new version: the admin shows a notice with a
+link to the download. To do this it asks GitHub for the latest release, at
+most twice a day and only while you're signed in to the admin, so your
+visitors are never involved. Settings → *Check now* checks straight away,
+and you can switch the checks off there too.
 
 ## Writing
 

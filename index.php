@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 1.9.0 "Obsoletus"
+ *  Version 1.10.0 "Arada"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -15,7 +15,8 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.9.0';
+const WREN_VERSION = '1.10.0';
+const WREN_REPO = 'Wren-CMS/wren-cms';
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -552,6 +553,96 @@ function indexnow_ping(array $urls): void
         'ignore_errors' => true,
     ]]);
     @file_get_contents(setting('indexnow_endpoint', 'https://api.indexnow.org/indexnow'), false, $ctx);
+}
+
+/* ---------------------------------------------------------- update check */
+/* Tells the admin when a newer release is out on GitHub; updating is still
+   the usual "replace index.php". Only admin pages ever check, at most every
+   12 hours (an hour after a failure), so public visitors never wait on it and
+   a shared host's IP stays well inside GitHub's 60-requests-an-hour limit. */
+function http_get_json(string $url): ?array
+{
+    $headers = ['User-Agent: Wren/' . WREN_VERSION, 'Accept: application/vnd.github+json'];
+    $raw = false;
+    if (ini_get('allow_url_fopen')) {
+        $ctx = stream_context_create(['http' => [
+            'method' => 'GET', 'header' => implode("\r\n", $headers) . "\r\n",
+            'timeout' => 3, 'ignore_errors' => true,
+        ]]);
+        $raw = @file_get_contents($url, false, $ctx);
+        $status = isset($http_response_header[0])
+            && preg_match('#\s(\d{3})\s#', $http_response_header[0] . ' ', $m) ? (int)$m[1] : 0;
+        if ($status !== 200) {
+            $raw = false;
+        }
+    } elseif (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_HTTPHEADER => $headers,
+                                CURLOPT_TIMEOUT => 3, CURLOPT_FOLLOWLOCATION => true]);
+        $raw = curl_exec($ch);
+        if (curl_getinfo($ch, CURLINFO_HTTP_CODE) !== 200) {
+            $raw = false;
+        }
+        curl_close($ch);
+    }
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    return is_array($data) ? $data : null;
+}
+
+/* The latest release as ['version', 'url', 'checked', 'ok'], from a 12-hour
+   cache unless $force; null when update checks are switched off. */
+function update_info(bool $force = false): ?array
+{
+    if (setting('update_check', '1') !== '1') {
+        return null;
+    }
+    $cache = json_decode(setting('update_cache'), true);
+    if (!$force && is_array($cache)
+        && time() - (int)$cache['checked'] < ($cache['ok'] ? 43200 : 3600)) {
+        return $cache;
+    }
+    $rel = http_get_json(setting('update_endpoint',
+        'https://api.github.com/repos/' . WREN_REPO . '/releases/latest'));
+    $version = ltrim((string)($rel['tag_name'] ?? ''), 'vV');
+    $info = ['version' => '', 'url' => 'https://github.com/' . WREN_REPO . '/releases/latest',
+             'checked' => time(), 'ok' => false];
+    if (preg_match('/^\d+(\.\d+){1,3}$/', $version)) {
+        $info['version'] = $version;
+        $info['ok'] = true;
+        $html = (string)($rel['html_url'] ?? '');
+        if (str_starts_with($html, 'https://github.com/' . WREN_REPO . '/')) {
+            $info['url'] = $html;
+        }
+    } elseif (is_array($cache) && ($cache['version'] ?? '') !== '') {
+        // Keep the last good answer through a failed check, so a notice
+        // doesn't vanish just because GitHub didn't answer this time.
+        $info['version'] = $cache['version'];
+        $info['url'] = $cache['url'];
+    }
+    set_setting('update_cache', json_encode($info));
+    return $info;
+}
+
+function update_status_text(): string
+{
+    $info = update_info();
+    if ($info === null) {
+        return 'update checks off';
+    }
+    $when = utc_to_local(gmdate('Y-m-d H:i:s', (int)$info['checked']), 'j M H:i');
+    if ($info['version'] === '') {
+        return 'could not check for updates (' . $when . ')';
+    }
+    return version_compare($info['version'], WREN_VERSION, '>')
+        ? '<a href="' . e($info['url']) . '" target="_blank" rel="noopener">' . e($info['version']) . ' available</a>'
+        : 'up to date (checked ' . $when . ')';
+}
+
+function update_available(): ?array
+{
+    $info = update_info();
+    return $info && $info['version'] !== '' && version_compare($info['version'], WREN_VERSION, '>')
+        ? $info : null;
 }
 
 /* ------------------------------------------------------ scheduled publishing */
@@ -1470,6 +1561,11 @@ function admin_shell(string $title, string $body, bool $nav = true): never
     }
     $f = flash();
     $flashHtml = $f ? '<p class="flash">' . e($f) . '</p>' : '';
+    if ($nav && ($up = update_available())) {
+        $flashHtml = '<p class="update">Wren ' . e($up['version']) . ' is available &mdash; you have '
+            . WREN_VERSION . '. <a href="' . e($up['url']) . '" target="_blank" rel="noopener">Download it from GitHub</a>,
+            then replace index.php as usual.</p>' . $flashHtml;
+    }
     echo '<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
@@ -1514,6 +1610,8 @@ button.danger { background:transparent; color:var(--red); padding:0.2rem 0.4rem;
 .check { display:flex; gap:0.5rem; align-items:center; font-weight:400; margin-top:0.9rem; }
 .check input { width:auto; margin:0; }
 .flash { background:var(--straw); border-left:3px solid var(--moss); padding:0.6rem 0.9rem; }
+.update { background:#fff; border:1px solid var(--moss); border-left-width:3px;
+          padding:0.6rem 0.9rem; }
 .err { background:#F6E7E4; border-left:3px solid var(--red); padding:0.6rem 0.9rem; }
 .topline { display:flex; align-items:baseline; justify-content:space-between; }
 .btn-link { display:inline-block; background:var(--moss); color:#fff; text-decoration:none;
@@ -2223,6 +2321,16 @@ function view_admin_settings(): never
             }
             redirect(url('admin/settings') . '#twofactor');
         }
+        if (($_POST['form'] ?? '') === 'updatecheck') {
+            $info = update_info(true);
+            flash(match (true) {
+                $info === null => 'Update checks are switched off.',
+                !$info['ok'] => 'Could not reach GitHub just now — try again later.',
+                version_compare($info['version'], WREN_VERSION, '>') => 'Wren ' . $info['version'] . ' is available.',
+                default => 'You have the latest version of Wren.',
+            });
+            redirect(url('admin/settings'));
+        }
         if (($_POST['form'] ?? '') === 'password') {
             $st = db()->prepare('SELECT * FROM users WHERE username = ?');
             $st->execute([$_SESSION['wren_user']]);
@@ -2250,6 +2358,7 @@ function view_admin_settings(): never
             set_setting('og_image', trim((string)($_POST['og_image'] ?? '')));
             set_setting('indexnow', isset($_POST['indexnow']) ? '1' : '0');
             set_setting('comments', isset($_POST['comments']) ? '1' : '0');
+            set_setting('update_check', isset($_POST['update_check']) ? '1' : '0');
             $hp = (string)($_POST['home_page'] ?? '');
             if ($hp !== '' && !post_by_slug($hp)) {
                 $hp = ''; // only published pages can be the homepage
@@ -2320,6 +2429,9 @@ function view_admin_settings(): never
         <label class="check"><input type="checkbox" name="pretty_urls" value="1" '
           . (setting('pretty_urls') === '1' ? 'checked' : '') . '>
           Pretty URLs <span class="hint">(needs the .htaccess file from the Wren download)</span></label>
+        <label class="check"><input type="checkbox" name="update_check" value="1" '
+          . (setting('update_check', '1') === '1' ? 'checked' : '') . '>
+          Tell me when a new version of Wren is out <span class="hint">(asks GitHub at most twice a day, only from the admin)</span></label>
         <button>Save settings</button>
       </form>
       <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">
@@ -2339,7 +2451,13 @@ function view_admin_settings(): never
       <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">
       <h1 style="font-size:1.2rem" id="twofactor">Two-factor authentication</h1>
       ' . twofactor_panel() . '
-      <p class="muted" style="margin-top:2.5rem">Wren ' . WREN_VERSION . ' &middot; database: wren.db (SQLite)</p>');
+      <form method="post" class="muted" style="margin-top:2.5rem">
+        ' . csrf_field() . '
+        <input type="hidden" name="form" value="updatecheck">
+        Wren ' . WREN_VERSION . ' &middot; ' . update_status_text() . ' &middot; database: wren.db (SQLite)
+        ' . (setting('update_check', '1') === '1'
+            ? '<button class="approve" style="margin-left:0.5rem">Check now</button>' : '') . '
+      </form>');
 }
 
 /* ----------------------------------------------------------------- router */
