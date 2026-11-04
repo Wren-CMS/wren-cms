@@ -95,6 +95,22 @@ Two more for linking and business details:
 
 That's the entire theming API. A theme is one HTML file a designer can read.
 
+### Licensed themes
+
+Themes bought from a Wren Shop can be licensed for one website. A licensed
+theme carries one comment in its `theme.html`:
+
+```
+<!-- wren-licensed-theme: aurora from https://wrencms.com/shop/ -->
+```
+
+Enter the licence key under **Settings → Theme licence** and press
+**Get licence**; Wren keeps the licence fresh by itself. A licensed theme
+without a valid licence still works, but its footer says so. Your own and
+free themes are never checked, and test addresses (localhost, `.test`) always
+pass. Needs PHP's sodium extension. See the
+[wiki](https://github.com/Wren-CMS/wren-cms/wiki/Licensed-themes).
+
 ## Starter packs
 
 A starter pack is a ready-made website for a kind of business — a theme,

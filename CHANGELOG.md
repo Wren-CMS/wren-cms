@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.11.0 "Hiemalis" — 4 November 2026
+
+- New: support for licensed themes bought from a Wren Shop. A theme that is
+  licensed says so with one comment in its theme.html; Wren then checks that
+  this website holds a licence for it
+- Settings → Theme licence: enter your licence key and press "Get licence",
+  or paste a licence. Licences are signed by the shop and checked here, so
+  they can't be forged or copied to another website
+- A licensed theme with no valid licence for the site keeps working, but the
+  footer says "Theme not licensed for this domain" and the admin shows a
+  notice saying why
+- Your own themes, free themes and starter packs are never checked. Test
+  addresses (localhost, 127.0.0.1, .test, .local, .localhost) always pass,
+  so sites can be built before they go live
+- Licences last 30 days and Wren renews them by itself when fewer than 20
+  days are left, from the admin or, at most every six hours, after a visitor's
+  page has been sent (on most hosts). If the shop can't be reached, the site carries on; if
+  the licence was cancelled or moved, the footer line appears
+- Needs PHP's sodium extension (most hosts have it); Settings says if it's
+  missing
+
+
 ## 1.10.0 "Arada" — 4 November 2026
 
 - New: Wren tells you when a new version is out. The admin shows a notice

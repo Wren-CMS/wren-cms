@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 1.10.0 "Arada"
+ *  Version 1.11.0 "Hiemalis"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -15,8 +15,14 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.10.0';
+const WREN_VERSION = '1.11.0';
 const WREN_REPO = 'Wren-CMS/wren-cms';
+
+/* Public keys of shops that sell licensed Wren themes. A licence is only
+   believed if one of these signed it (the private halves never leave the shops). */
+const WREN_THEME_KEYS = [
+    'w8LmrIIhDJEv2eoiHGEjXxRy8Gp0QwB1+RobE4D0sxk=',   // Forty Nine Systems Ltd: wrencms.com/shop
+];
 define('WREN_DIR', __DIR__);
 define('WREN_DB', WREN_DIR . '/wren.db');
 
@@ -429,6 +435,9 @@ function require_admin(): void
     if (!is_admin()) {
         redirect(url('admin/login'));
     }
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET') {
+        theme_licence_refresh(8);   // a licensed theme's licence, when it's due a fresh one
+    }
 }
 
 /* ---------------------------------------------------- markdown (tiny, tidy) */
@@ -643,6 +652,242 @@ function update_available(): ?array
     $info = update_info();
     return $info && $info['version'] !== '' && version_compare($info['version'], WREN_VERSION, '>')
         ? $info : null;
+}
+
+/* ------------------------------------------------------------ theme licences */
+/* Themes bought from a theme shop are licensed for one website. Such a theme
+   says so with a comment in its theme.html:
+       <!-- wren-licensed-theme: aurora from https://wrencms.com/shop/ -->
+   Themes without that comment (your own, free ones, starter packs) are never
+   checked. For a licensed theme, Wren keeps a licence document signed by the
+   shop, naming the theme and the website. If it's missing, for another theme,
+   for another website, or not genuinely signed, the admin shows a notice and
+   the site's footer says the theme isn't licensed. localhost and other test
+   addresses always pass, so a site can be built before it goes live. */
+
+function theme_licence_marker(?string $theme = null): ?array
+{
+    if ($theme === null) {
+        $file = WREN_DIR . '/theme.html';
+        $theme = is_file($file) ? (string)file_get_contents($file) : '';
+    }
+    if (!preg_match('/<!--\s*wren-licensed-theme:\s*([a-z0-9][a-z0-9-]{1,39})(?:\s+from\s+(https?:\/\/[^\s>]+?))?\s*-->/i', $theme, $m)) {
+        return null;
+    }
+    $from = $m[2] ?? '';
+    if (str_starts_with(strtolower($from), 'http:') && !domain_is_local((string)parse_url($from, PHP_URL_HOST))) {
+        $from = '';   // licences only come over https (plain http is for a shop on a test address)
+    }
+    return ['id' => strtolower($m[1]), 'from' => $from !== '' ? rtrim($from, '/') . '/' : ''];
+}
+
+/* This site's address without "www." or a port, e.g. "example.com". */
+function site_domain(): string
+{
+    $h = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+    $h = preg_replace('/:\d+$/', '', $h);
+    return preg_replace('/^www\./', '', rtrim($h, '.'));
+}
+
+function domain_is_local(string $d): bool
+{
+    if ($d === '' || $d === 'localhost' || $d === '[::1]' || preg_match('/\.(localhost|test|local|invalid|example)$/', $d) === 1) {
+        return true;
+    }
+    return filter_var($d, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) !== false && str_starts_with($d, '127.');   // 127.0.0.0/8, not 127.example.com
+}
+
+/* "https://www.Shop.com/x/" -> "shop.com", for comparing a licence's issuer with the theme's shop */
+function licence_host(string $url): string
+{
+    return preg_replace('/^www\./', '', strtolower((string)parse_url($url, PHP_URL_HOST)));
+}
+
+/* The licence's details if it was genuinely signed by a theme shop, else null. */
+function theme_licence_read(string $text): ?array
+{
+    if (!function_exists('sodium_crypto_sign_verify_detached')
+        || !preg_match('/-----BEGIN WREN THEME LICENCE-----(.*?)-----END WREN THEME LICENCE-----/s', $text, $m)) {
+        return null;
+    }
+    $parts = explode('.', preg_replace('/\s+/', '', $m[1]));
+    if (count($parts) !== 2) {
+        return null;
+    }
+    $payload = base64_decode($parts[0], true);
+    $sig = base64_decode($parts[1], true);
+    if ($payload === false || $sig === false || strlen($sig) !== SODIUM_CRYPTO_SIGN_BYTES) {
+        return null;
+    }
+    foreach (WREN_THEME_KEYS as $k) {
+        $pk = base64_decode($k, true);
+        if ($pk !== false && strlen($pk) === SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES
+            && sodium_crypto_sign_verify_detached($sig, $payload, $pk)) {
+            $data = json_decode($payload, true);
+            return is_array($data) ? $data : null;
+        }
+    }
+    return null;
+}
+
+/* ['needed' => bool, 'ok' => bool, 'why' => text, 'theme' => marker, 'licence' => details] */
+function theme_licence_state(): array
+{
+    static $state = null;
+    if ($state !== null) {
+        return $state;
+    }
+    $marker = theme_licence_marker();
+    if (!$marker) {
+        return $state = ['needed' => false, 'ok' => true, 'why' => '', 'theme' => null, 'licence' => null];
+    }
+    $lic = theme_licence_read(setting('theme_licence'));
+    $here = site_domain();
+    $why = match (true) {
+        domain_is_local($here)                              => '',
+        !function_exists('sodium_crypto_sign_verify_detached') => 'This server\'s PHP is missing the sodium extension, which Wren needs to check theme licences. Ask your host to turn it on.',
+        setting('theme_licence') === ''                     => setting('theme_licence_error') !== '' ? setting('theme_licence_error') : 'There\'s no licence for this theme yet.',
+        $lic === null                                       => 'The saved licence isn\'t a genuine one.',
+        ($lic['theme'] ?? '') !== $marker['id']             => 'The saved licence is for a different theme.',
+        !theme_licence_issuer_ok($lic, $marker)             => 'The saved licence is from a different shop than the theme\'s.',
+        ($lic['domain'] ?? '') !== $here                    => 'The licence is for ' . ($lic['domain'] ?? '?') . ', not ' . $here . '.',
+        (int)($lic['expires'] ?? 0) < time()                => 'The licence needs renewing, and Wren couldn\'t get a fresh one from '
+                                                               . ($marker['from'] !== '' ? licence_host($marker['from']) : 'the shop') . '. Press Get licence to try now.',
+        default                                             => '',
+    };
+    return $state = ['needed' => true, 'ok' => $why === '', 'why' => $why, 'theme' => $marker, 'licence' => $lic];
+}
+
+function theme_licence_issuer_ok(array $lic, array $marker): bool
+{
+    return $marker['from'] === '' || licence_host((string)($lic['issuer'] ?? '')) === licence_host($marker['from']);
+}
+
+/* Fetch a fresh licence for this site from the shop that sold the theme.
+   $status is the shop's answer: 0 if it couldn't be reached. */
+function theme_licence_fetch(string $from, string $key, ?string &$error, ?string $domain = null, int $timeout = 8, ?int &$status = null): ?string
+{
+    $url = $from . 'licence/' . rawurlencode($key) . '?domain=' . rawurlencode($domain ?? site_domain());
+    $body = false;
+    $status = 0;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => $timeout, CURLOPT_CONNECTTIMEOUT => min(4, $timeout), CURLOPT_FOLLOWLOCATION => false,
+                                CURLOPT_PROTOCOLS => domain_is_local((string)parse_url($from, PHP_URL_HOST)) ? CURLPROTO_HTTPS | CURLPROTO_HTTP : CURLPROTO_HTTPS, CURLOPT_USERAGENT => 'Wren/' . WREN_VERSION]);
+        $body = curl_exec($ch);
+        $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+    } elseif (ini_get('allow_url_fopen')) {
+        $ctx = stream_context_create(['http' => ['timeout' => $timeout, 'ignore_errors' => true, 'follow_location' => 0,
+                                                 'header' => 'User-Agent: Wren/' . WREN_VERSION . "\r\n"]]);
+        $body = @file_get_contents($url, false, $ctx);
+        $status = isset($http_response_header[0]) && preg_match('#\s(\d{3})\s#', $http_response_header[0] . ' ', $mm) ? (int)$mm[1] : 0;
+    }
+    if (!is_string($body) || $status === 0) {
+        $error = 'Wren couldn\'t reach ' . parse_url($from, PHP_URL_HOST) . ' just now. Try again in a moment.';
+        return null;
+    }
+    if ($status !== 200) {
+        $error = trim(mb_substr(strip_tags($body), 0, 300)) ?: 'The shop answered ' . $status . '.';
+        return null;
+    }
+    return $body;
+}
+
+/* Saves a licence after checking it fits this theme and this site. */
+function theme_licence_save(string $text, ?string &$error): bool
+{
+    $marker = theme_licence_marker();
+    $lic = theme_licence_read($text);
+    $here = site_domain();
+    $error = match (true) {
+        $marker === null                         => 'The theme in use doesn\'t need a licence.',
+        !function_exists('sodium_crypto_sign_verify_detached') => 'This server\'s PHP is missing the sodium extension, which Wren needs to check theme licences. Ask your host to turn it on.',
+        $lic === null                            => 'That isn\'t a genuine Wren theme licence. Copy the whole thing, including the BEGIN and END lines.',
+        ($lic['theme'] ?? '') !== $marker['id']  => 'That licence is for a different theme (' . ($lic['theme'] ?? '?') . ').',
+        !theme_licence_issuer_ok($lic, $marker)  => 'That licence is from a different shop than the theme\'s.',
+        !domain_is_local($here) && ($lic['domain'] ?? '') !== $here => 'That licence is for ' . ($lic['domain'] ?? '?') . ', not this site (' . $here . ').',
+        (int)($lic['expires'] ?? 0) < time()     => 'That licence has run out. Press Get licence for a fresh one.',
+        default                                  => null,
+    };
+    if ($error !== null) {
+        return false;
+    }
+    set_setting('theme_licence', trim($text));
+    set_setting('theme_licence_key', (string)($lic['key'] ?? ''));
+    set_setting('theme_licence_error', '');
+    return true;
+}
+
+/* Licences last a month or so; Wren fetches a fresh one when fewer than 20 days are
+   left, at most every 6 hours, for the website the licence is for (never whatever a
+   visitor's Host header says). If the shop says the licence was cancelled or moved,
+   it's dropped straight away; if the shop can't be reached, the old one carries on. */
+function theme_licence_refresh_due(): bool
+{
+    $marker = theme_licence_marker();
+    $lic = $marker ? theme_licence_read(setting('theme_licence')) : null;
+    return $marker && $lic && $marker['from'] !== '' && setting('theme_licence_key') !== ''
+        && ($lic['domain'] ?? '') === site_domain() && !domain_is_local(site_domain())
+        && (int)($lic['expires'] ?? 0) < time() + 20 * 86400
+        && (int)setting('theme_licence_tried', '0') < time() - 6 * 3600;
+}
+
+function theme_licence_refresh(int $timeout = 4): void
+{
+    if (!theme_licence_refresh_due()) {
+        return;
+    }
+    set_setting('theme_licence_tried', (string)time());   // first, so visitors arriving together don't all ask
+    $marker = theme_licence_marker();
+    $lic = theme_licence_read(setting('theme_licence'));
+    $text = theme_licence_fetch($marker['from'], setting('theme_licence_key'), $err, (string)$lic['domain'], $timeout, $status);
+    if ($text !== null) {
+        theme_licence_save($text, $err);
+    } elseif (in_array($status, [403, 404, 409], true)) {   // cancelled, unknown, or moved to another website
+        set_setting('theme_licence', '');
+        set_setting('theme_licence_error', 'The shop no longer licenses this theme for this website: ' . $err);
+    }
+}
+
+/* From a public page: after the visitor has their page where the server allows it. */
+function theme_licence_refresh_later(): void
+{
+    if (!theme_licence_refresh_due()) {
+        return;
+    }
+    register_shutdown_function(function () {
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        } elseif (function_exists('litespeed_finish_request')) {
+            litespeed_finish_request();
+        }
+        theme_licence_refresh();
+    });
+}
+
+function theme_licence_panel(): string
+{
+    $s = theme_licence_state();
+    if (!$s['needed']) {
+        return '';
+    }
+    $lic = $s['licence'];
+    $status = $s['ok']
+        ? ($lic ? 'Licensed for <strong>' . e($lic['domain'] ?? '') . '</strong>' . (domain_is_local(site_domain()) ? ' (and this test address always works)' : '')
+                : 'This test address doesn\'t need a licence. Add one before the site goes live.')
+        : '<span style="color:var(--red)">Not licensed: ' . e($s['why']) . '</span>';
+    return '<h1 style="font-size:1.2rem" id="licence">Theme licence</h1>
+      <p>Your theme, <strong>' . e($s['theme']['id']) . '</strong>, is licensed for one website. ' . $status . '.</p>'
+      . ($s['theme']['from'] !== '' ? '<form method="post">' . csrf_field() . '<input type="hidden" name="form" value="licence_get">
+        <label>Licence key <span class="hint">(from your account where you bought the theme)</span>
+          <input name="licence_key" value="' . e(setting('theme_licence_key')) . '" autocomplete="off" autocapitalize="characters" placeholder="WREN-XXXX-XXXX-XXXX-XXXX"></label>
+        <button>Get licence</button>
+        <p class="muted">Moved the site, or changed the licence\'s website in your account? Press Get licence again.</p></form>' : '')
+      . '<details style="margin-top:1rem"><summary class="muted">Or paste a licence</summary><form method="post">' . csrf_field()
+      . '<input type="hidden" name="form" value="licence_paste"><textarea name="licence_text" style="min-height:8rem" placeholder="-----BEGIN WREN THEME LICENCE-----"></textarea>
+        <button>Save licence</button></form></details>
+      <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">';
 }
 
 /* ------------------------------------------------------ scheduled publishing */
@@ -1151,6 +1396,13 @@ function render(string $pageTitle, string $content, string $activeSlug = '', arr
     if (!str_contains($theme, '{{seo_head}}')) {
         $html = preg_replace('/<\/head>/i', $head . "\n</head>", $html, 1);
     }
+    theme_licence_refresh_later();
+    $lic = theme_licence_state();
+    if (!$lic['ok']) {
+        $note = '<p class="wren-unlicensed" style="text-align:center;font:13px/1.4 system-ui,sans-serif;margin:12px 0;opacity:.85">'
+              . 'Theme not licensed for this domain</p>';
+        $html = stripos($html, '</body>') !== false ? preg_replace('/<\/body>/i', $note . '</body>', $html, 1) : $html . $note;
+    }
     echo $html;
     exit;
 }
@@ -1561,6 +1813,10 @@ function admin_shell(string $title, string $body, bool $nav = true): never
     }
     $f = flash();
     $flashHtml = $f ? '<p class="flash">' . e($f) . '</p>' : '';
+    if ($nav && !($ls = theme_licence_state())['ok']) {
+        $flashHtml = '<p class="err">Your theme isn\'t licensed for this website: ' . e($ls['why'])
+            . ' <a href="' . e(url('admin/settings')) . '#licence">Sort it out in Settings</a>.</p>' . $flashHtml;
+    }
     if ($nav && ($up = update_available())) {
         $flashHtml = '<p class="update">Wren ' . e($up['version']) . ' is available &mdash; you have '
             . WREN_VERSION . '. <a href="' . e($up['url']) . '" target="_blank" rel="noopener">Download it from GitHub</a>,
@@ -2321,6 +2577,25 @@ function view_admin_settings(): never
             }
             redirect(url('admin/settings') . '#twofactor');
         }
+        if (in_array($_POST['form'] ?? '', ['licence_get', 'licence_paste'], true)) {
+            $err = null;
+            if ($_POST['form'] === 'licence_get') {
+                $marker = theme_licence_marker();
+                $key = strtoupper(trim((string)($_POST['licence_key'] ?? '')));
+                $text = $marker && $marker['from'] !== '' && $key !== '' ? theme_licence_fetch($marker['from'], $key, $err) : null;
+                if ($key === '') {
+                    $err = 'Enter the licence key.';
+                }
+            } else {
+                $text = (string)($_POST['licence_text'] ?? '');
+            }
+            if ($text !== null && theme_licence_save($text, $err)) {
+                flash('Theme licence saved.');
+            } else {
+                flash('The licence wasn\'t saved. ' . $err);
+            }
+            redirect(url('admin/settings') . '#licence');
+        }
         if (($_POST['form'] ?? '') === 'updatecheck') {
             $info = update_info(true);
             flash(match (true) {
@@ -2449,6 +2724,7 @@ function view_admin_settings(): never
         <button>Change password</button>
       </form>
       <hr style="border:0;border-top:1px solid var(--line);margin:2.2rem 0">
+      ' . theme_licence_panel() . '
       <h1 style="font-size:1.2rem" id="twofactor">Two-factor authentication</h1>
       ' . twofactor_panel() . '
       <form method="post" class="muted" style="margin-top:2.5rem">
