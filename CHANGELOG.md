@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.12.0 "Brunneicapillus" — 12 November 2026
+
+- New: Site address (Settings). Wren uses it for every address search engines
+  see: canonical links, og:url, sitemap.xml, robots.txt, RSS and IndexNow.
+  Visitors arriving on another address, such as www. or http, are sent to it
+  with a permanent (301) redirect, so Google sees one site instead of two.
+  It's filled in the first time you use the admin after upgrading; check it
+  in Settings. The admin is never redirected, so a wrong address can always
+  be fixed, and Settings warns you if you're using the admin somewhere else.
+  Leave it blank to keep the old behaviour
+- New: Search title for pages and articles. When set, it's the title in
+  Google and social shares on its own, instead of "Title · Site title". The
+  editor counts the characters (50 to 60 works best)
+- New: Home page search title (Settings). If you leave it blank, the
+  homepage's title is now "Site title · Tagline" rather than just the site
+  title
+- Article lists (the home page or News) now have one main heading, and each
+  article in the list is a second-level heading. Themes that style
+  `h1.post-title` should change it to `.post-title` to keep list titles
+  looking the same
+- New: Share image for pages and articles. Without one, the first picture in
+  the text is used, then the site's share image. Shared links now show a
+  large picture card whenever there's an image, with its alt text
+- New: Author name (Settings) with an optional author for each article. Articles
+  show "By …" beside the date when one is set, and tell search engines their
+  published and updated times and author, including the structured data
+  Google uses for articles. Themes can use the new {{author}} tag
+- New: Show in menu, on pages. Untick it for pages such as Thanks or Privacy:
+  they work as normal but are left out of the menu
+- The built-in theme's site name is no longer a heading, so each page has a
+  single main heading
+- Database: adds four columns to posts automatically on first load
+
+
 ## 1.11.0 "Hiemalis" — 4 November 2026
 
 - New: support for licensed themes bought from a Wren Shop. A theme that is

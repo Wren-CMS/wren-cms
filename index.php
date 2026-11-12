@@ -1,7 +1,7 @@
 <?php
 /*
  *  Wren CMS — a whole website in one small file.
- *  Version 1.11.0 "Hiemalis"
+ *  Version 1.12.0 "Brunneicapillus"
  *
  *  Requirements: PHP 8.1+ with PDO SQLite (standard on almost every host).
  *  Install: upload this file. Visit it in a browser. That's it.
@@ -15,7 +15,7 @@
 
 declare(strict_types=1);
 
-const WREN_VERSION = '1.11.0';
+const WREN_VERSION = '1.12.0';
 const WREN_REPO = 'Wren-CMS/wren-cms';
 
 /* Public keys of shops that sell licensed Wren themes. A licence is only
@@ -85,6 +85,19 @@ function wren_migrate(PDO $pdo): void
         // 1 = hidden from search engines (robots noindex, no sitemap, no IndexNow)
         $pdo->exec('ALTER TABLE posts ADD COLUMN noindex INTEGER NOT NULL DEFAULT 0');
     }
+    if ($cols && !in_array('seo_title', $cols, true)) {
+        // 1.12.0: search title, share image, per-article author, show in menu
+        $pdo->exec('ALTER TABLE posts ADD COLUMN seo_title TEXT NOT NULL DEFAULT ""');
+    }
+    if ($cols && !in_array('share_image', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN share_image TEXT NOT NULL DEFAULT ""');
+    }
+    if ($cols && !in_array('author', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN author TEXT NOT NULL DEFAULT ""');
+    }
+    if ($cols && !in_array('in_menu', $cols, true)) {
+        $pdo->exec('ALTER TABLE posts ADD COLUMN in_menu INTEGER NOT NULL DEFAULT 1');
+    }
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_posts_due ON posts (published, publish_at)');
     $ucols = array_column($pdo->query('PRAGMA table_info(users)')->fetchAll(), 'name');
     if ($ucols && !in_array('totp_secret', $ucols, true)) {
@@ -132,6 +145,10 @@ function wren_schema(PDO $pdo): void
             position  INTEGER NOT NULL DEFAULT 0,
             publish_at TEXT NOT NULL DEFAULT "",
             noindex   INTEGER NOT NULL DEFAULT 0,
+            seo_title TEXT NOT NULL DEFAULT "",
+            share_image TEXT NOT NULL DEFAULT "",
+            author    TEXT NOT NULL DEFAULT "",
+            in_menu   INTEGER NOT NULL DEFAULT 1,
             created   TEXT NOT NULL,
             updated   TEXT NOT NULL
         );
@@ -265,11 +282,65 @@ function url(string $route = ''): string
     return ($base ?: '') . '/?q=' . rawurlencode($route);
 }
 
+/* The scheme and host this request arrived on, e.g. "https://www.example.com".
+   Behind a proxy or load balancer (Coolify, Cloudflare and the like) PHP sees
+   plain http, so the usual forwarded headers count as https too. */
+function request_origin(): string
+{
+    $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || strtolower((string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https'
+        || strtolower((string)($_SERVER['HTTP_X_FORWARDED_SSL'] ?? '')) === 'on'
+        || (string)($_SERVER['SERVER_PORT'] ?? '') === '443';
+    return ($https ? 'https' : 'http') . '://' . strtolower((string)($_SERVER['HTTP_HOST'] ?? 'localhost'));
+}
+
+/* "https://Example.com/anything" -> "https://example.com"; null if it isn't a
+   web address. Only the scheme, host and port are kept: Wren adds its own
+   folder (if it lives in one) when it builds addresses. */
+function normalise_site_url(string $u): ?string
+{
+    $u = trim($u);
+    if ($u !== '' && !preg_match('#^https?://#i', $u)) {
+        $u = 'https://' . $u;
+    }
+    $p = parse_url($u);
+    if (!$p || empty($p['host']) || !in_array(strtolower($p['scheme'] ?? ''), ['http', 'https'], true)
+        || !preg_match('/^[a-z0-9.-]+$/i', $p['host'])) {
+        return null;
+    }
+    return strtolower($p['scheme']) . '://' . strtolower($p['host']) . (isset($p['port']) ? ':' . (int)$p['port'] : '');
+}
+
+/* The one address this site goes by (Settings → Site address), or "" if not set. */
+function site_url(): string
+{
+    return setting('site_url');
+}
+
 function abs_url(string $route = ''): string
 {
-    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    return $scheme . '://' . $host . url($route);
+    return (site_url() ?: request_origin()) . url($route);
+}
+
+/* Public requests on any other address (www or not, http or https) are sent
+   to the Site address with a 301, so search engines see one site, not two.
+   Never for the admin, so a mistyped address can always be fixed; never for
+   POSTs; and not when someone is working on a copy of the site on a test
+   address (localhost, .test, …) that isn't the site's own. */
+function enforce_site_url(string $q): void
+{
+    $want = site_url();
+    $have = request_origin();
+    if ($want === '' || $want === $have || str_starts_with($q, 'admin')
+        || !in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', ['GET', 'HEAD'], true)) {
+        return;
+    }
+    $bare = fn(string $origin) => preg_replace('/^www\./', '', preg_replace('/:\d+$/', '', (string)parse_url($origin, PHP_URL_HOST)));
+    if (domain_is_local($bare($have)) && $bare($have) !== $bare($want)) {
+        return;
+    }
+    header('Location: ' . $want . ($_SERVER['REQUEST_URI'] ?? '/'), true, 301);
+    exit;
 }
 
 function redirect(string $to): never
@@ -549,7 +620,7 @@ function indexnow_ping(array $urls): void
         return;
     }
     $payload = json_encode([
-        'host'        => $_SERVER['HTTP_HOST'] ?? 'localhost',
+        'host'        => (string)parse_url(abs_url(), PHP_URL_HOST),
         'key'         => indexnow_key(),
         'keyLocation' => abs_url(indexnow_key() . '.txt'),
         'urlList'     => array_values(array_unique($urls)),
@@ -1268,6 +1339,7 @@ function pack_install(array $pack, array $values, array $opt): array
    Otherwise the built-in default below is used. Tags a theme may use:
    {{site_title}} {{tagline}} {{page_title}} {{menu}} {{content}}
    {{home_url}} {{rss_url}} {{year}} {{generator}} {{seo_head}}
+   {{author}} (an article's author, if one is set; blank elsewhere)
    {{url:some-slug}} for a page's address, and [[key]] for any business
    detail saved by a starter pack (e.g. [[phone]], [[email]]).              */
 
@@ -1276,6 +1348,7 @@ function menu_html(string $activeSlug = ''): string
     $homePage = setting('home_page');
     $rows = db()->query('SELECT id, type, slug, title, body, position, parent, newtab FROM posts
                          WHERE type IN ("page", "link") AND published = 1
+                         AND (type = "link" OR in_menu = 1)
                          ORDER BY position, title')->fetchAll();
     $byId = [];
     foreach ($rows as $r) {
@@ -1333,6 +1406,79 @@ function menu_html(string $activeSlug = ''): string
     return implode("\n", array_column($entries, 1));
 }
 
+/* Any image address (absolute, root-relative or relative) as a full URL on
+   the Site address, as social networks need. */
+function abs_src(string $src): string
+{
+    $src = trim($src);
+    if ($src === '' || preg_match('#^https?://#i', $src)) {
+        return $src;
+    }
+    if (str_starts_with($src, '//')) {
+        return 'https:' . $src;
+    }
+    $origin = site_url() ?: request_origin();
+    return $origin . (str_starts_with($src, '/') ? $src : base_path() . '/' . $src);
+}
+
+/* The first <img> in some rendered HTML as ['src' => …, 'alt' => …], or null. */
+function first_image(string $html): ?array
+{
+    if (!preg_match('/<img\b[^>]*>/i', $html, $tag)) {
+        return null;
+    }
+    $attr = function (string $n) use ($tag): string {
+        if (!preg_match('/\s' . $n . '\s*=\s*(?:"([^"]*)"|\'([^\']*)\')/i', $tag[0], $m)) {
+            return '';
+        }
+        $v = ($m[1] ?? '') !== '' ? $m[1] : ($m[2] ?? '');
+        return html_entity_decode($v, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    };
+    $src = $attr('src');
+    return $src === '' ? null : ['src' => $src, 'alt' => $attr('alt')];
+}
+
+/* The homepage's <title>: the Home page search title setting, or "Site title · Tagline". */
+function home_search_title(): string
+{
+    $t = setting('home_seo_title');
+    if ($t !== '') {
+        return $t;
+    }
+    $site = setting('site_title', 'Wren');
+    $tag = setting('tagline');
+    return $tag !== '' ? $site . ' · ' . $tag : $site;
+}
+
+/* A square-ish site icon for the publisher in structured data, if the site has one. */
+function site_icon_url(): string
+{
+    foreach (['apple-touch-icon.png', 'icon-512.png', 'icon.png', 'logo.png', 'favicon.png'] as $f) {
+        if (is_file(WREN_DIR . '/' . $f)) {
+            return abs_src($f);
+        }
+    }
+    return '';
+}
+
+function article_author(array $p): string
+{
+    return trim((string)($p['author'] ?? '')) ?: setting('author_name');
+}
+
+/* "12 November 2026 · By Alan Paynter" for an article. */
+function post_meta_html(array $p): string
+{
+    $author = article_author($p);
+    return '<p class="post-meta">' . e(gmdate('j F Y', strtotime($p['created'])))
+        . ($author !== '' ? ' &middot; <span class="post-author">By ' . e($author) . '</span>' : '') . '</p>';
+}
+
+function iso_time(string $utc): string
+{
+    return (new DateTime($utc, new DateTimeZone('UTC')))->format('c');
+}
+
 function render(string $pageTitle, string $content, string $activeSlug = '', array $seo = []): never
 {
     $themeFile = WREN_DIR . '/theme.html';
@@ -1347,7 +1493,10 @@ function render(string $pageTitle, string $content, string $activeSlug = '', arr
 
     // ---- SEO head block: description, canonical, Open Graph / Twitter card
     $desc = trim($seo['description'] ?? '') ?: setting('meta_description', setting('tagline'));
-    $fullTitle = $pageTitle !== '' ? $pageTitle . ' · ' . $siteTitle : $siteTitle;
+    // A search title stands on its own; otherwise "Page · Site title" as before.
+    $fullTitle = trim((string)($seo['title'] ?? '')) !== ''
+        ? trim((string)$seo['title'])
+        : ($pageTitle !== '' ? $pageTitle . ' · ' . $siteTitle : $siteTitle);
     $canonical = abs_url($seo['route'] ?? $activeSlug);
     if (($seo['pg'] ?? 1) > 1) {
         $canonical .= (str_contains($canonical, '?') ? '&' : '?') . 'pg=' . (int)$seo['pg'];
@@ -1365,10 +1514,50 @@ function render(string $pageTitle, string $content, string $activeSlug = '', arr
     $head .= '<meta property="og:title" content="' . e($fullTitle) . '">' . "\n";
     $head .= '<meta property="og:description" content="' . e($desc) . '">' . "\n";
     $head .= '<meta property="og:url" content="' . e($canonical) . '">' . "\n";
-    if (($img = setting('og_image')) !== '') {
-        $head .= '<meta property="og:image" content="' . e($img) . '">' . "\n";
+    // Share image: the page's own (Share image field, then first image in the
+    // body), falling back to the site-wide one.
+    $img = abs_src((string)($seo['image'] ?? ''));
+    $imgAlt = $img !== '' ? (string)($seo['image_alt'] ?? '') : '';
+    if ($img === '') {
+        $img = abs_src(setting('og_image'));
     }
-    $head .= '<meta name="twitter:card" content="summary">';
+    if ($img !== '') {
+        $head .= '<meta property="og:image" content="' . e($img) . '">' . "\n";
+        if ($imgAlt !== '') {
+            $head .= '<meta property="og:image:alt" content="' . e($imgAlt) . '">' . "\n";
+        }
+    }
+    if (!empty($seo['article'])) {
+        $a = $seo['article'];
+        $head .= '<meta property="article:published_time" content="' . e(iso_time($a['created'])) . '">' . "\n";
+        $head .= '<meta property="article:modified_time" content="' . e(iso_time($a['updated'])) . '">' . "\n";
+        if ($a['author'] !== '') {
+            $head .= '<meta property="article:author" content="' . e($a['author']) . '">' . "\n";
+        }
+        $ld = [
+            '@context'         => 'https://schema.org',
+            '@type'            => 'BlogPosting',
+            'headline'         => mb_substr($a['headline'], 0, 110),
+            'description'      => $desc,
+            'datePublished'    => iso_time($a['created']),
+            'dateModified'     => iso_time($a['updated']),
+            'mainEntityOfPage' => ['@type' => 'WebPage', '@id' => $canonical],
+        ];
+        if ($img !== '') {
+            $ld['image'] = [$img];
+        }
+        if ($a['author'] !== '') {
+            $ld['author'] = ['@type' => 'Person', 'name' => $a['author']];
+        }
+        $ld['publisher'] = ['@type' => 'Organization', 'name' => $siteTitle];
+        if (($icon = site_icon_url()) !== '') {
+            $ld['publisher']['logo'] = ['@type' => 'ImageObject', 'url' => $icon];
+        }
+        $head .= '<script type="application/ld+json">'
+               . json_encode($ld, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP)
+               . '</script>' . "\n";
+    }
+    $head .= '<meta name="twitter:card" content="' . ($img !== '' ? 'summary_large_image' : 'summary') . '">';
     if (str_contains($vars_menu = menu_html($activeSlug), 'menu-drop')) {
         $head .= "\n" . '<style>.menu-sub{position:relative;display:inline-flex;align-items:center}'
                . '.menu-drop{display:none;position:absolute;left:0;top:100%;min-width:11em;'
@@ -1384,7 +1573,8 @@ function render(string $pageTitle, string $content, string $activeSlug = '', arr
         '{{seo_head}}'   => $head,
         '{{site_title}}' => e($siteTitle),
         '{{tagline}}'    => e(setting('tagline')),
-        '{{page_title}}' => e($pageTitle !== '' ? $pageTitle . ' · ' . $siteTitle : $siteTitle),
+        '{{page_title}}' => e($fullTitle),
+        '{{author}}'     => e($seo['article']['author'] ?? ''),
         '{{menu}}'       => menu_html($activeSlug),
         '{{content}}'    => $content,
         '{{home_url}}'   => e(url()),
@@ -1456,9 +1646,13 @@ nav.menu a { color: var(--quiet); text-decoration: none; margin-right: 1.4rem; }
 nav.menu a:hover, nav.menu a.active { color: var(--moss-d); }
 main { padding: 2.5rem 0 3rem; }
 article + article { margin-top: 3rem; padding-top: 3rem; border-top: 1px solid var(--line); }
-h1.post-title { font-size: 1.75rem; font-weight: 400; margin: 0 0 0.3rem; line-height: 1.25; }
-h1.post-title a { color: var(--ink); text-decoration: none; }
-h1.post-title a:hover { color: var(--moss-d); }
+.post-title { font-size: 1.75rem; font-weight: 400; margin: 0 0 0.3rem; line-height: 1.25; }
+.post-title a { color: var(--ink); text-decoration: none; }
+.post-title a:hover { color: var(--moss-d); }
+.list-title {
+  font-family: system-ui, -apple-system, sans-serif; font-size: 0.85rem; font-weight: 600;
+  color: var(--quiet); letter-spacing: 0.08em; text-transform: uppercase; margin: 0 0 1.5rem;
+}
 .post-meta {
   font-family: system-ui, -apple-system, sans-serif;
   font-size: 0.78rem; color: var(--quiet);
@@ -1505,7 +1699,7 @@ footer.site a { color: var(--quiet); }
 <body>
 <div class="wrap">
   <header class="site">
-    <h1 class="masthead"><a href="{{home_url}}">{{site_title}}</a></h1>
+    <p class="masthead"><a href="{{home_url}}">{{site_title}}</a></p>
     <p class="tagline">{{tagline}}</p>
     <nav class="menu">{{menu}}</nav>
   </header>
@@ -1539,20 +1733,27 @@ function view_home(string $routeBase = ''): never
     $posts = $st->fetchAll();
 
     $listTitle = $routeBase === '' ? '' : setting('blog_title', 'Blog');
+    $listSeo = ['route' => $routeBase, 'pg' => $pg];
+    if ($routeBase === '') {
+        $listSeo['title'] = home_search_title() . ($pg > 1 ? ' · Page ' . $pg : '');
+    } elseif ($pg > 1) {
+        $listTitle .= ' · Page ' . $pg;
+    }
 
     if (!$posts && $pg === 1) {
         $content = '<article><h1 class="post-title">Nothing here yet</h1>'
                  . '<div class="post-body"><p>This site runs on Wren. '
                  . '<a href="' . e(url('admin')) . '">Sign in</a> to write your first article.</p></div></article>';
-        render($listTitle, $content, $routeBase, ['route' => $routeBase]);
+        render($listTitle, $content, $routeBase, $listSeo);
     }
 
-    $out = [];
+    // One H1 for the list itself; each article in it is an H2.
+    $out = ['<h1 class="list-title">' . e($routeBase === '' ? setting('site_title', 'Wren') : setting('blog_title', 'Blog')) . '</h1>'];
     foreach ($posts as $p) {
         $link = e(url($p['slug']));
         $out[] = '<article>'
-               . '<h1 class="post-title"><a href="' . $link . '">' . e($p['title']) . '</a></h1>'
-               . '<p class="post-meta">' . e(gmdate('j F Y', strtotime($p['created']))) . '</p>'
+               . '<h2 class="post-title"><a href="' . $link . '">' . e($p['title']) . '</a></h2>'
+               . post_meta_html($p)
                . '<div class="post-body"><p>' . e(excerpt($p['body'])) . '</p></div>'
                . '<a class="more" href="' . $link . '">Read on &rarr;</a>'
                . '</article>';
@@ -1572,7 +1773,7 @@ function view_home(string $routeBase = ''): never
              . '</div>';
     }
 
-    render($listTitle, implode("\n", $out) . $nav, $routeBase, ['route' => $routeBase, 'pg' => $pg]);
+    render($listTitle, implode("\n", $out) . $nav, $routeBase, $listSeo);
 }
 
 function comments_enabled(array $post): bool
@@ -1662,24 +1863,42 @@ function comments_html(array $post): string
 
 function view_post(array $post, bool $asHome = false): never
 {
-    $meta = $post['type'] === 'article'
-        ? '<p class="post-meta">' . e(gmdate('j F Y', strtotime($post['created']))) . '</p>'
-        : '';
+    $meta = $post['type'] === 'article' ? post_meta_html($post) : '';
     $h1 = ($post['show_title'] ?? 1)
         ? '<h1 class="post-title">' . e($post['title']) . '</h1>'
         : '';
+    $bodyHtml = markdown($post['body']);
     $content = '<article>'
              . $h1
              . $meta
-             . '<div class="post-body">' . markdown($post['body']) . '</div>'
+             . '<div class="post-body">' . $bodyHtml . '</div>'
              . comments_html($post)
              . '</article>';
-    render($asHome ? '' : $post['title'], $content, $asHome ? '' : $post['slug'], [
+    // Share image: the Share image field, else the first image in the body
+    // (with its alt text, also used when it's the same picture as the field's).
+    $first = first_image($bodyHtml);
+    $share = trim((string)($post['share_image'] ?? ''));
+    $image = $share !== '' ? $share : ($first['src'] ?? '');
+    $imageAlt = $first && ($share === '' || $first['src'] === $share) ? $first['alt'] : '';
+    $seoTitle = trim((string)($post['seo_title'] ?? ''));
+    $seo = [
+        'title'       => $seoTitle !== '' ? $seoTitle : ($asHome ? home_search_title() : ''),
         'description' => trim($post['description'] ?? '') ?: excerpt($post['body'], 158),
         'route'       => $asHome ? '' : $post['slug'],
         'type'        => $post['type'] === 'article' ? 'article' : 'website',
         'noindex'     => (int)($post['noindex'] ?? 0) === 1,
-    ]);
+        'image'       => $image,
+        'image_alt'   => $imageAlt,
+    ];
+    if ($post['type'] === 'article') {
+        $seo['article'] = [
+            'headline' => $seoTitle !== '' ? $seoTitle : $post['title'],
+            'created'  => $post['created'],
+            'updated'  => $post['updated'],
+            'author'   => article_author($post),
+        ];
+    }
+    render($asHome ? '' : $post['title'], $content, $asHome ? '' : $post['slug'], $seo);
 }
 
 function view_404(): never
@@ -2003,6 +2222,9 @@ function view_admin_list(string $type): never
         if ((int)$p['noindex']) {
             $badge .= '<span class="draft">hidden from search</span>';
         }
+        if ($p['type'] === 'page' && !(int)$p['in_menu']) {
+            $badge .= '<span class="draft">not in menu</span>';
+        }
         $rows .= '<tr>
             <td><a href="' . e(url('admin/edit/' . $p['id'])) . '">' . e($p['title']) . '</a>' . $badge . '</td>
             <td class="muted">' . e(gmdate('j M Y', strtotime($p['created']))) . '</td>
@@ -2081,7 +2303,19 @@ function view_admin_edit(?array $post, string $type): never
              ' . parent_select((int)($post['parent'] ?? 0), (int)($post['id'] ?? 0)) . '</label>
            <label class="check"><input type="checkbox" name="show_title" value="1" '
              . (($post['show_title'] ?? 1) ? 'checked' : '') . '>
-             Show title on the page <span class="hint">(untick for a homepage)</span></label>'
+             Show title on the page <span class="hint">(untick for a homepage)</span></label>
+           <label class="check"><input type="checkbox" name="in_menu" value="1" '
+             . (($post['in_menu'] ?? 1) ? 'checked' : '') . '>
+             Show in menu <span class="hint">(untick for pages such as Thanks or Privacy that are linked from elsewhere; they still work)</span></label>'
+        : '';
+    $seoLen = mb_strlen((string)($post['seo_title'] ?? ''));
+    $mediaOpts = '';
+    foreach (media_list() as $f) {
+        $mediaOpts .= '<option value="' . e(media_url($f)) . '">';
+    }
+    $authorField = $type === 'article'
+        ? '<label>Author <span class="hint">(blank = ' . (setting('author_name') !== '' ? e(setting('author_name')) . ', from Settings' : 'none; set a default in Settings') . ')</span>
+             <input name="author" value="' . e($post['author'] ?? '') . '"></label>'
         : '';
     $scheduleField = $type === 'article'
         ? '<label>Publish on <span class="hint">(' . e(site_tz()->getName()) . ' time)</span>
@@ -2101,6 +2335,14 @@ function view_admin_edit(?array $post, string $type): never
         ' . $posField . '
         <label>Search description <span class="hint">(for Google and social shares, ~155 characters; blank = automatic from the text)</span>
           <input name="description" maxlength="300" value="' . e($post['description'] ?? '') . '"></label>
+        <label>Search title <span class="hint">(optional: the title in Google, used on its own instead of "Title · Site title"; aim for 50–60 characters)</span>
+          <input name="seo_title" maxlength="120" value="' . e($post['seo_title'] ?? '') . '"
+            oninput="this.nextElementSibling.textContent = this.value.length + \' characters\'">
+          <span class="hint">' . $seoLen . ' characters</span></label>
+        <label>Share image <span class="hint">(optional: the picture shown when this is shared on social media; blank = the first image in the text, then the site\'s share image)</span>
+          <input name="share_image" list="wren-media" placeholder="pick from Media or paste an address" value="' . e($post['share_image'] ?? '') . '"></label>
+        <datalist id="wren-media">' . $mediaOpts . '</datalist>
+        ' . $authorField . '
         <label>Body <span class="hint">(markdown — **bold**, *italic*, # headings, [links](url), ``` code; images from <a href="' . e(url('admin/media')) . '">Media</a>)</span>
           <textarea name="body">' . e($post['body'] ?? '') . '</textarea></label>
         <label class="check"><input type="checkbox" name="published" value="1" '
@@ -2131,6 +2373,10 @@ function admin_save(): never
     $description = trim((string)($_POST['description'] ?? ''));
     $allowComments = isset($_POST['allow_comments']) ? 1 : 0;
     $noindex = ($type !== 'link' && isset($_POST['noindex'])) ? 1 : 0;
+    $seoTitle = $type === 'link' ? '' : mb_substr(trim((string)($_POST['seo_title'] ?? '')), 0, 120);
+    $shareImage = $type === 'link' ? '' : trim((string)($_POST['share_image'] ?? ''));
+    $author = $type === 'article' ? trim((string)($_POST['author'] ?? '')) : '';
+    $inMenu = ($type === 'page' && !isset($_POST['in_menu'])) ? 0 : 1;
     $newtab = isset($_POST['newtab']) ? 1 : 0;
     $parent = (int)($_POST['parent'] ?? 0);
     if ($parent > 0) {
@@ -2150,6 +2396,12 @@ function admin_save(): never
 
     if ($title === '') {
         flash('A title is required.');
+        redirect(url($id ? 'admin/edit/' . $id : 'admin/new/' . $type));
+    }
+    // A share image is a plain web address: https://…, /path or a relative path.
+    if ($shareImage !== '' && (preg_match('/[\s"\'<>]/', $shareImage)
+        || (preg_match('/^[a-z][a-z0-9+.-]*:/i', $shareImage) && !preg_match('#^https?://#i', $shareImage)))) {
+        flash('The Share image must be an image address, such as one from Media or starting with https:// — nothing was saved.');
         redirect(url($id ? 'admin/edit/' . $id : 'admin/new/' . $type));
     }
     // Articles only: a future "Publish on" schedules the post (published stays
@@ -2180,10 +2432,11 @@ function admin_save(): never
         $redate = $old && $old['type'] === 'article' && !(int)$old['published'] && $published;
         $st = db()->prepare('UPDATE posts SET title=?, slug=?, body=?, published=?, position=?,
                              show_title=?, description=?, allow_comments=?, parent=?, newtab=?,
-                             publish_at=?, noindex=?, created=COALESCE(?, created), updated=? WHERE id=?');
+                             publish_at=?, noindex=?, seo_title=?, share_image=?, author=?, in_menu=?,
+                             created=COALESCE(?, created), updated=? WHERE id=?');
         $st->execute([$title, $slug, $body, $published, $position, $showTitle, $description,
-                      $allowComments, $parent, $newtab, $publishAt, $noindex, $redate ? now() : null,
-                      now(), $id]);
+                      $allowComments, $parent, $newtab, $publishAt, $noindex, $seoTitle, $shareImage,
+                      $author, $inMenu, $redate ? now() : null, now(), $id]);
         if ($parent > 0) {
             // one level deep: a page that becomes a child passes its children to the top
             db()->prepare('UPDATE posts SET parent = 0 WHERE parent = ?')->execute([$id]);
@@ -2192,10 +2445,11 @@ function admin_save(): never
     } else {
         $st = db()->prepare('INSERT INTO posts (type, slug, title, body, published, position,
                              show_title, description, allow_comments, parent, newtab, publish_at,
-                             noindex, created, updated)
-                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+                             noindex, seo_title, share_image, author, in_menu, created, updated)
+                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
         $st->execute([$type, $slug, $title, $body, $published, $position, $showTitle, $description,
-                      $allowComments, $parent, $newtab, $publishAt, $noindex, now(), now()]);
+                      $allowComments, $parent, $newtab, $publishAt, $noindex, $seoTitle, $shareImage,
+                      $author, $inMenu, now(), now()]);
         flash(ucfirst($type) . ' created.');
     }
     if ($publishAt !== '') {
@@ -2541,6 +2795,17 @@ function business_details_fields(): string
     return $out;
 }
 
+function site_url_warning(): string
+{
+    $want = site_url();
+    $have = request_origin();
+    if ($want === '' || $want === $have) {
+        return '';
+    }
+    return '<p class="err">You\'re using the admin at <strong>' . e($have) . '</strong>, but the Site address is <strong>'
+        . e($want) . '</strong>. Visitors on this address are sent there. If that\'s wrong, correct the Site address and save.</p>';
+}
+
 function view_admin_settings(): never
 {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -2621,7 +2886,17 @@ function view_admin_settings(): never
                 flash('Password changed.');
             }
         } else {
+            $su = trim((string)($_POST['site_url'] ?? ''));
+            $suN = $su === '' ? '' : normalise_site_url($su);
+            if ($suN === null) {
+                flash('The Site address must be a web address such as https://example.com — nothing was saved.');
+                redirect(url('admin/settings'));
+            }
+            set_setting('site_url', $suN);
+            set_setting('site_url_set', '1');
             set_setting('site_title', trim((string)($_POST['site_title'] ?? 'Wren')));
+            set_setting('home_seo_title', trim((string)($_POST['home_seo_title'] ?? '')));
+            set_setting('author_name', trim((string)($_POST['author_name'] ?? '')));
             set_setting('tagline', trim((string)($_POST['tagline'] ?? '')));
             set_setting('posts_per_page', (string)max(1, (int)($_POST['posts_per_page'] ?? 5)));
             $tz = (string)($_POST['timezone'] ?? '');
@@ -2672,8 +2947,15 @@ function view_admin_settings(): never
       <form method="post">
         ' . csrf_field() . '
         <input type="hidden" name="form" value="site">
+        <label>Site address <span class="hint">(the one address search engines should use, e.g. https://example.com; visitors on www., http or any other address are sent here. Blank = whatever address is used)</span>
+          <input name="site_url" placeholder="https://example.com" value="' . e(site_url()) . '"></label>
+        ' . site_url_warning() . '
         <label>Site title <input name="site_title" required value="' . e(setting('site_title', 'Wren')) . '"></label>
         <label>Tagline <input name="tagline" value="' . e(setting('tagline')) . '"></label>
+        <label>Home page search title <span class="hint">(the homepage\'s title in Google, 50–60 characters works best; blank = "Site title · Tagline")</span>
+          <input name="home_seo_title" maxlength="120" value="' . e(setting('home_seo_title')) . '"></label>
+        <label>Author name <span class="hint">(shown on articles and given to search engines; each article can override it; blank = none)</span>
+          <input name="author_name" value="' . e(setting('author_name')) . '"></label>
         <label>Site search description <span class="hint">(shown for the homepage in Google; blank = tagline)</span>
           <input name="meta_description" maxlength="300" value="' . e(setting('meta_description')) . '"></label>
         <label>Social share image URL <span class="hint">(optional, used by Open Graph)</span>
@@ -2758,6 +3040,14 @@ if (needs_setup()) {
 }
 
 publish_due();
+
+// Fill in the Site address the first time the owner uses the admin after
+// upgrading (not on a visitor's request, which might arrive on www. or http).
+if (setting('site_url_set') !== '1' && str_starts_with($q, 'admin') && is_admin()) {
+    set_setting('site_url', normalise_site_url(request_origin()) ?? '');
+    set_setting('site_url_set', '1');
+}
+enforce_site_url($q);
 
 /* One address per page: with pretty URLs on, an old-style ?q= address is the
    twin of a clean path, so send it there permanently.

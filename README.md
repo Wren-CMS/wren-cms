@@ -7,7 +7,7 @@ from scratch for the modern web. One PHP file, one SQLite database it creates
 itself, no framework, no Composer, no build step. Upload it, open it in a
 browser, and start writing.
 
-Version 1.10.0 "Arada" — stable · MIT licence
+Version 1.12.0 "Brunneicapillus" — stable · MIT licence
 
 **Website:** <https://wrencms.com> · **Documentation:** <https://github.com/Wren-CMS/wren-cms/wiki>
 
@@ -69,6 +69,13 @@ and you can switch the checks off there too.
   `noindex` tag, leaves it out of `sitemap.xml` and doesn't ping IndexNow
   for it. It still works for anyone with the link, and articles stay in the
   RSS feed.
+- **Search engines:** set your *Site address* in Settings and Wren uses it
+  everywhere search engines look (canonical links, sitemap, RSS, robots.txt),
+  sending visitors on `www.`, `http` or any other address to it, so Google
+  sees one site rather than two. Pages and articles can have their own
+  *Search title* and *Share image*; articles carry their date and author for
+  search engines and social networks. Pages such as Thanks or Privacy can be
+  left out of the menu with *Show in menu*.
 - **Images:** upload JPG, PNG, GIF or WebP in the admin's Media tab, then click
   an image's address to copy ready-made markdown into any post.
 - **Comments:** readers can comment on articles (and pages, if you opt one
@@ -87,6 +94,11 @@ things to appear:
 
     {{site_title}}  {{tagline}}   {{page_title}}  {{menu}}
     {{content}}     {{home_url}}  {{rss_url}}     {{year}}  {{generator}}
+    {{author}}      an article's author, when one is set
+
+Article titles in lists are `<h2 class="post-title">` and a single article's
+is `<h1 class="post-title">`, so style them with `.post-title` rather than
+`h1.post-title`. A list starts with its own `<h1 class="list-title">`.
 
 Two more for linking and business details:
 
